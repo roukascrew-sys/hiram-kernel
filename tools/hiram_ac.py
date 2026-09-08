@@ -57,3 +57,5 @@ def eval_node(circuit, root_id, evidence):
         return res
 
     return _eval(root_id)
+
+eval_evidence = eval_node

@@ -169,10 +169,11 @@ HiramAuditReport hiram_audit_hazard(const Evidence* base_ev, Rational max_accept
         return rep;
     }
 
-    /* 2. Validate Evidence Mask Boundaries */
+    /* 2. Validate Evidence Mask Boundaries & Canonical Form (values_mask <= observed_mask) */
     uint32_t valid_mask = (1u << CIRCUIT_VAR_COUNT) - 1u;
     if ((base_ev->observed_mask & ~valid_mask) != 0 ||
-        (base_ev->values_mask & ~valid_mask) != 0) {
+        (base_ev->values_mask & ~valid_mask) != 0 ||
+        (base_ev->values_mask & ~base_ev->observed_mask) != 0) {
         rep.decision = HIRAM_REJECTED_INVALID_INPUT;
         rep.hazard_probability = (Rational){0LL, 1LL};
         return rep;
