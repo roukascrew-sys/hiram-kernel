@@ -24,3 +24,6 @@ __pycache__/
 .idea/
 Thumbs.db
 Desktop.ini
+*.elf
+*.bin
+*_m7.o
