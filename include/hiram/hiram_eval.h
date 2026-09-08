@@ -1,12 +1,23 @@
 #ifndef HIRAM_EVAL_H
 #define HIRAM_EVAL_H
 
+/*
+ * MinGW-w64 CRT Header Defense:
+ * Suppresses conflicting '__int128' typedef in _mingw.h when -U__SIZEOF_INT128__ is passed.
+ */
+#if (defined(__MINGW32__) || defined(__MINGW64__)) && !defined(__SIZEOF_INT128__)
+#define __SIZEOF_INT128__ 16
+#define __HIRAM_FORCED_64BIT__ 1
+#endif
+
 #include <stdint.h>
 #include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define CIRCUIT_VAR_COUNT 12
 
 typedef struct {
     int64_t num;
