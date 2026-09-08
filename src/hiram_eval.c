@@ -4,40 +4,51 @@
 #include "hiram_circuit_data.h"
 #include <stdio.h>
 
-/* 128-bit Binary Euclidean GCD Algorithm */
-static inline __int128_t gcd128(__int128_t a, __int128_t b) {
+/*
+ * Architecture-Adaptive Accumulator:
+ * Uses __int128_t on 64-bit systems (x86_64 host),
+ * falls back to int64_t on 32-bit embedded targets (ARM Cortex-M7).
+ */
+#if defined(__SIZEOF_INT128__)
+typedef __int128_t hiram_acc_t;
+#else
+typedef int64_t hiram_acc_t;
+#endif
+
+/* Euclidean GCD Algorithm */
+static inline hiram_acc_t gcd_acc(hiram_acc_t a, hiram_acc_t b) {
     if (a < 0) a = -a;
     if (b < 0) b = -b;
     while (b != 0) {
-        __int128_t r = a % b;
+        hiram_acc_t r = a % b;
         a = b;
         b = r;
     }
     return a;
 }
 
-static inline Rational rational_make(__int128_t n, __int128_t d) {
+static inline Rational rational_make(hiram_acc_t n, hiram_acc_t d) {
     if (d < 0) { n = -n; d = -d; }
     if (n == 0) return (Rational){0LL, 1LL};
-    __int128_t g = gcd128(n, d);
+    hiram_acc_t g = gcd_acc(n, d);
     return (Rational){(int64_t)(n / g), (int64_t)(d / g)};
 }
 
 static inline Rational rational_mul(Rational a, Rational b) {
     if (a.num == 0 || b.num == 0) return (Rational){0LL, 1LL};
-    __int128_t g1 = gcd128(a.num, b.den);
-    __int128_t g2 = gcd128(b.num, a.den);
-    __int128_t n = (__int128_t)(a.num / g1) * (b.num / g2);
-    __int128_t d = (__int128_t)(a.den / g2) * (b.den / g1);
+    hiram_acc_t g1 = gcd_acc(a.num, b.den);
+    hiram_acc_t g2 = gcd_acc(b.num, a.den);
+    hiram_acc_t n = (hiram_acc_t)(a.num / g1) * (b.num / g2);
+    hiram_acc_t d = (hiram_acc_t)(a.den / g2) * (b.den / g1);
     return (Rational){(int64_t)n, (int64_t)d};
 }
 
 static inline Rational rational_add(Rational a, Rational b) {
     if (a.num == 0) return b;
     if (b.num == 0) return a;
-    __int128_t g = gcd128(a.den, b.den);
-    __int128_t d = ((__int128_t)a.den / g) * b.den;
-    __int128_t n = ((__int128_t)a.num * (b.den / g)) + ((__int128_t)b.num * (a.den / g));
+    hiram_acc_t g = gcd_acc(a.den, b.den);
+    hiram_acc_t d = ((hiram_acc_t)a.den / g) * b.den;
+    hiram_acc_t n = ((hiram_acc_t)a.num * (b.den / g)) + ((hiram_acc_t)b.num * (a.den / g));
     return rational_make(n, d);
 }
 
@@ -88,7 +99,6 @@ Rational hiram_eval_evidence(const Evidence* ev) {
             res = (Rational){1LL, 1LL};
             for (uint16_t c = 0; c < n->child_count; c++) {
                 uint16_t child_id = g_circuit_children[n->child_offset + c];
-                /* child_id < i strictly guaranteed by topological sort */
                 res = rational_mul(res, memo[child_id]);
                 if (res.num == 0) break;
             }
@@ -96,7 +106,6 @@ Rational hiram_eval_evidence(const Evidence* ev) {
             res = (Rational){0LL, 1LL};
             for (uint16_t c = 0; c < n->child_count; c++) {
                 uint16_t child_id = g_circuit_children[n->child_offset + c];
-                /* child_id < i strictly guaranteed by topological sort */
                 Rational w = g_circuit_weights[n->weight_offset + c];
                 Rational branch = rational_mul(w, memo[child_id]);
                 res = rational_add(res, branch);
@@ -129,8 +138,8 @@ HiramAuditReport hiram_audit_hazard(const Evidence* base_ev, Rational max_accept
     rep.hazard_probability = posterior;
 
     /* Integer cross-multiplication: posterior > max_acceptable_risk */
-    __int128_t lhs = (__int128_t)posterior.num * max_acceptable_risk.den;
-    __int128_t rhs = (__int128_t)max_acceptable_risk.num * posterior.den;
+    hiram_acc_t lhs = (hiram_acc_t)posterior.num * max_acceptable_risk.den;
+    hiram_acc_t rhs = (hiram_acc_t)max_acceptable_risk.num * posterior.den;
 
     if (lhs > rhs) {
         rep.decision = HIRAM_VETOED_SAFETY_VIOLATION;
