@@ -8,6 +8,18 @@ import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
+# Resolve repository paths
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
+SRC_FILE = os.path.join(REPO_ROOT, "src", "hiram_eval.c")
+DLL_FILE = os.path.join(REPO_ROOT, "hiram_eval.dll")
+INC_DIR = os.path.join(REPO_ROOT, "include")
+INC_HIRAM_DIR = os.path.join(REPO_ROOT, "include", "hiram")
+
+# Add tools/ to sys.path so modules import cleanly
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
 from hiram_ac import eval_node
 from hiram_checker import Rule
 from hiram_compiler import compile_from_rules
@@ -42,6 +54,8 @@ def compile_shared_library(src_path: str, dll_path: str):
         "-O3",
         "-shared",
         "-Wall",
+        f"-I{INC_DIR}",
+        f"-I{INC_HIRAM_DIR}",
         "-Wl,--export-all-symbols",
         src_path,
         "-o",
@@ -86,7 +100,6 @@ class HiramAuditReport(ctypes.Structure):
     ]
 
 
-# Decision Constants matching hiram_eval.h
 HIRAM_APPROVED = 0
 HIRAM_VETOED_SAFETY_VIOLATION = 1
 HIRAM_REJECTED_CONTRADICTION = 2
@@ -101,11 +114,9 @@ DECISION_NAMES = {
 def load_hiram_dll(dll_path: str) -> ctypes.CDLL:
     lib = ctypes.CDLL(os.path.abspath(dll_path))
 
-    # void hiram_evidence_init(Evidence* ev);
     lib.hiram_evidence_init.argtypes = [ctypes.POINTER(Evidence)]
     lib.hiram_evidence_init.restype = None
 
-    # void hiram_evidence_set(Evidence* ev, uint16_t var_id, bool val);
     lib.hiram_evidence_set.argtypes = [
         ctypes.POINTER(Evidence),
         ctypes.c_uint16,
@@ -113,20 +124,13 @@ def load_hiram_dll(dll_path: str) -> ctypes.CDLL:
     ]
     lib.hiram_evidence_set.restype = None
 
-    # Rational hiram_eval_evidence(const Evidence* ev);
     lib.hiram_eval_evidence.argtypes = [ctypes.POINTER(Evidence)]
     lib.hiram_eval_evidence.restype = Rational
 
-    # HiramAuditReport hiram_audit_hazard(const Evidence* base_ev, Rational max_acceptable_risk);
     lib.hiram_audit_hazard.argtypes = [ctypes.POINTER(Evidence), Rational]
     lib.hiram_audit_hazard.restype = HiramAuditReport
 
     return lib
-
-
-# -----------------------------------------------------------------------------
-# 3. Canonical Flight Knowledge Base Reference Setup
-# -----------------------------------------------------------------------------
 
 
 def build_reference_kb():
@@ -164,28 +168,24 @@ def build_reference_kb():
         "structural_hazard": Fraction(1, 500),
     }
 
-    kb = compile_from_rules(rules, priors)
-    return kb
+    return compile_from_rules(rules, priors)
 
 
 # -----------------------------------------------------------------------------
-# 4. Differential Test Suite
+# 3. Differential Test Execution
 # -----------------------------------------------------------------------------
 
 
 def run_differential_suite(num_trials: int = 1000):
-    src_file = "hiram_eval.c"
-    dll_file = "hiram_eval.dll"
-
-    compile_shared_library(src_file, dll_file)
-    c_lib = load_hiram_dll(dll_file)
+    compile_shared_library(SRC_FILE, DLL_FILE)
+    c_lib = load_hiram_dll(DLL_FILE)
     kb = build_reference_kb()
 
     hazard_var_id = kb.var_to_id["stall_hazard"]
     all_vars = list(range(len(kb.var_to_id)))
 
     print("=" * 80)
-    print(f"HIRAM CROSS-LANGUAGE DIFFERENTIAL VERIFICATION (PYTHON vs C DLL)")
+    print("HIRAM CROSS-LANGUAGE DIFFERENTIAL VERIFICATION (PYTHON vs C DLL)")
     print("=" * 80)
     print(f"Total Flight Variables: {len(all_vars)}")
     print(f"Monitored Hazard Var:   'stall_hazard' (ID {hazard_var_id})")
@@ -194,19 +194,11 @@ def run_differential_suite(num_trials: int = 1000):
     py_total_time = 0.0
     c_total_time = 0.0
 
-    stats = {
-        "approved": 0,
-        "vetoed": 0,
-        "contradictions": 0,
-    }
-
-    # Common rational risk threshold: 5% (5/100)
+    stats = {"approved": 0, "vetoed": 0, "contradictions": 0}
     thresh_frac = Fraction(5, 100)
     thresh_c = Rational(thresh_frac.numerator, thresh_frac.denominator)
 
     for trial in range(1, num_trials + 1):
-        # Generate random partial evidence:
-        # Each non-hazard variable has a 45% chance of being observed
         py_evidence: Dict[int, bool] = {}
         for v in all_vars:
             if v == hazard_var_id:
@@ -214,26 +206,22 @@ def run_differential_suite(num_trials: int = 1000):
             if random.random() < 0.45:
                 py_evidence[v] = random.choice([True, False])
 
-        # Deterministic boundary edge cases in initial trials
         if trial == 1:
-            py_evidence = {}  # Pure unconditioned prior
+            py_evidence = {}
         elif trial == 2:
-            # Active stall condition
             py_evidence = {
                 kb.var_to_id["low_airspeed"]: True,
                 kb.var_to_id["high_angle_of_attack"]: True,
             }
         elif trial == 3:
-            # Nominal flight descent
             py_evidence = {
                 kb.var_to_id["terrain_clear"]: True,
                 kb.var_to_id["altitude_stable"]: True,
             }
 
-        # --- A. Python Oracle Evaluation ---
+        # Python Oracle
         t0 = time.perf_counter()
         py_p_e = eval_node(kb.circuit, kb.root_id, py_evidence)
-
         if py_p_e == Fraction(0, 1):
             py_decision = HIRAM_REJECTED_CONTRADICTION
             py_posterior = Fraction(0, 1)
@@ -242,14 +230,15 @@ def run_differential_suite(num_trials: int = 1000):
                 kb.circuit, kb.root_id, {**py_evidence, hazard_var_id: True}
             )
             py_posterior = py_p_hazard_and_e / py_p_e
-            if py_posterior > thresh_frac:
-                py_decision = HIRAM_VETOED_SAFETY_VIOLATION
-            else:
-                py_decision = HIRAM_APPROVED
+            py_decision = (
+                HIRAM_VETOED_SAFETY_VIOLATION
+                if py_posterior > thresh_frac
+                else HIRAM_APPROVED
+            )
         t1 = time.perf_counter()
         py_total_time += t1 - t0
 
-        # --- B. Native C Runtime Evaluation ---
+        # C Runtime
         ev_c = Evidence()
         c_lib.hiram_evidence_init(ctypes.byref(ev_c))
         for v, val in py_evidence.items():
@@ -265,33 +254,16 @@ def run_differential_suite(num_trials: int = 1000):
         c_posterior = c_report.hazard_probability.to_fraction()
         c_decision = c_report.decision
 
-        # --- C. Differential Invariant Assertions ---
-        # 1. Unconditioned / Conditioned mass must match down to identical integer fraction
-        if c_p_e != py_p_e:
-            raise AssertionError(
-                f"Trial {trial}: Evidence probability mismatch!\n"
-                f"  Evidence: {py_evidence}\n"
-                f"  Python:   {py_p_e.numerator}/{py_p_e.denominator}\n"
-                f"  C DLL:    {c_p_e_struct.num}/{c_p_e_struct.den}"
-            )
-
-        # 2. Conditional posterior hazard risk must match exactly
-        if c_posterior != py_posterior:
-            raise AssertionError(
-                f"Trial {trial}: Hazard posterior mismatch!\n"
-                f"  Evidence: {py_evidence}\n"
-                f"  Python:   {py_posterior.numerator}/{py_posterior.denominator}\n"
-                f"  C DLL:    {c_report.hazard_probability.num}/{c_report.hazard_probability.den}"
-            )
-
-        # 3. Guardian safety decision must be identical
-        if c_decision != py_decision:
-            raise AssertionError(
-                f"Trial {trial}: Decision divergence!\n"
-                f"  Evidence: {py_evidence}\n"
-                f"  Python:   {DECISION_NAMES[py_decision]}\n"
-                f"  C DLL:    {DECISION_NAMES[c_decision]}"
-            )
+        # Invariant Assertions
+        assert (
+            c_p_e == py_p_e
+        ), f"Trial {trial}: P(E) mismatch! Py={py_p_e} C={c_p_e}"
+        assert (
+            c_posterior == py_posterior
+        ), f"Trial {trial}: Posterior mismatch! Py={py_posterior} C={c_posterior}"
+        assert (
+            c_decision == py_decision
+        ), f"Trial {trial}: Decision mismatch! Py={py_decision} C={c_decision}"
 
         if c_decision == HIRAM_APPROVED:
             stats["approved"] += 1
@@ -302,7 +274,8 @@ def run_differential_suite(num_trials: int = 1000):
 
         if trial % 200 == 0:
             print(
-                f"  -> Verified {trial:>4}/{num_trials} states... (All exact fraction matches)"
+                f"  -> Verified {trial:>4}/{num_trials} states... (All exact"
+                " fraction matches)"
             )
 
     print("\n" + "=" * 80)
@@ -314,14 +287,14 @@ def run_differential_suite(num_trials: int = 1000):
     print(f"  - Contradictions:      {stats['contradictions']}")
     print("-" * 80)
     print(
-        f"Mean Python Latency:     {(py_total_time / num_trials) * 1e6:8.2f} us / frame"
+        f"Mean Python Latency:     {(py_total_time / num_trials) * 1e6:8.2f} us"
+        " / frame"
     )
     print(
-        f"Mean C DLL Latency:       {(c_total_time / num_trials) * 1e6:8.2f} us / frame (including ctypes marshaling)"
+        f"Mean C DLL Latency:      {(c_total_time / num_trials) * 1e6:8.2f} us"
+        " / frame"
     )
-    print(
-        f"Cross-Language Speedup:  {(py_total_time / c_total_time):8.1f}x"
-    )
+    print(f"Cross-Language Speedup:  {(py_total_time / c_total_time):8.1f}x")
     print("=" * 80)
 
 
