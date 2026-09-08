@@ -1,0 +1,26 @@
+# Binaries and Objects
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+*.obj
+
+# Build Directories
+build/
+bin/
+lib/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.hypothesis/
+
+# Editor / OS Artifacts
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
