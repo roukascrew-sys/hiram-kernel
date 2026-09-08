@@ -112,7 +112,21 @@ DECISION_NAMES = {
 
 
 def load_hiram_dll(dll_path: str) -> ctypes.CDLL:
-    lib = ctypes.CDLL(os.path.abspath(dll_path))
+    abs_dll = os.path.abspath(dll_path)
+    if sys.platform == 'win32':
+        for d in [os.path.dirname(abs_dll), r'C:\Users\rouka\w64devkit\bin']:
+            if os.path.isdir(d):
+                try: os.add_dll_directory(d)
+                except Exception: pass
+        import shutil
+        gcc_bin = shutil.which('gcc')
+        if gcc_bin:
+            try: os.add_dll_directory(os.path.dirname(os.path.abspath(gcc_bin)))
+            except Exception: pass
+        try: lib = ctypes.CDLL(abs_dll, winmode=0)
+        except TypeError: lib = ctypes.CDLL(abs_dll)
+    else:
+        lib = ctypes.CDLL(abs_dll)
 
     lib.hiram_evidence_init.argtypes = [ctypes.POINTER(Evidence)]
     lib.hiram_evidence_init.restype = None

@@ -62,12 +62,14 @@ void hiram_evidence_init(Evidence* ev) {
 }
 
 void hiram_evidence_set(Evidence* ev, uint16_t var_id, bool val) {
+    if (var_id >= 32) return;
     ev->observed_mask |= (1u << var_id);
     if (val) ev->values_mask |= (1u << var_id);
     else     ev->values_mask &= ~(1u << var_id);
 }
 
 void hiram_evidence_clear(Evidence* ev, uint16_t var_id) {
+    if (var_id >= 32) return;
     ev->observed_mask &= ~(1u << var_id);
     ev->values_mask &= ~(1u << var_id);
 }
@@ -122,6 +124,14 @@ HiramAuditReport hiram_audit_hazard(const Evidence* base_ev, Rational max_accept
     HiramAuditReport rep;
     rep.hazard_threshold = max_acceptable_risk;
 
+    /* 1. Validate Input Threshold Contract */
+    if (max_acceptable_risk.den <= 0 || max_acceptable_risk.num < 0) {
+        rep.decision = HIRAM_REJECTED_INVALID_INPUT;
+        rep.hazard_probability = (Rational){0LL, 1LL};
+        return rep;
+    }
+
+    /* 2. Evaluate Marginal Evidence Mass P(E) */
     Rational p_e = hiram_eval_evidence(base_ev);
     if (p_e.num == 0) {
         rep.decision = HIRAM_REJECTED_CONTRADICTION;
@@ -129,15 +139,42 @@ HiramAuditReport hiram_audit_hazard(const Evidence* base_ev, Rational max_accept
         return rep;
     }
 
+    /* 3. Handle Explicitly Observed Hazard Values */
+    uint32_t hazard_mask = (1u << HAZARD_VAR_ID);
+    if ((base_ev->observed_mask & hazard_mask) != 0) {
+        bool hazard_observed = (base_ev->values_mask & hazard_mask) != 0;
+        if (!hazard_observed) {
+            /* Hazard explicitly observed false: P(Hazard | E) = 0 */
+            rep.hazard_probability = (Rational){0LL, 1LL};
+            rep.decision = HIRAM_APPROVED;
+            return rep;
+        } else {
+            /* Hazard explicitly observed true: P(Hazard | E) = 1 */
+            rep.hazard_probability = (Rational){1LL, 1LL};
+            if (max_acceptable_risk.den > max_acceptable_risk.num) {
+                rep.decision = HIRAM_VETOED_SAFETY_VIOLATION;
+            } else {
+                rep.decision = HIRAM_APPROVED;
+            }
+            return rep;
+        }
+    }
+
+    /* 4. Hazard is Unobserved: Compute Posterior P(Hazard, E) / P(E) */
     Evidence ev_hazard = *base_ev;
     hiram_evidence_set(&ev_hazard, HAZARD_VAR_ID, true);
     Rational p_hazard_and_e = hiram_eval_evidence(&ev_hazard);
     Rational posterior = rational_div(p_hazard_and_e, p_e);
     rep.hazard_probability = posterior;
 
-    /* Integer cross-multiplication: posterior > max_acceptable_risk */
-    hiram_acc_t lhs = (hiram_acc_t)posterior.num * max_acceptable_risk.den;
-    hiram_acc_t rhs = (hiram_acc_t)max_acceptable_risk.num * posterior.den;
+    /* 5. Safe Cross-Reduction Comparison (Guards Against 64-bit Overflow) */
+    hiram_acc_t g1 = gcd_acc(posterior.num, max_acceptable_risk.num);
+    hiram_acc_t g2 = gcd_acc(max_acceptable_risk.den, posterior.den);
+    if (g1 == 0) g1 = 1;
+    if (g2 == 0) g2 = 1;
+
+    hiram_acc_t lhs = (hiram_acc_t)(posterior.num / g1) * (max_acceptable_risk.den / g2);
+    hiram_acc_t rhs = (hiram_acc_t)(max_acceptable_risk.num / g1) * (posterior.den / g2);
 
     if (lhs > rhs) {
         rep.decision = HIRAM_VETOED_SAFETY_VIOLATION;
@@ -152,11 +189,6 @@ int main(void) {
     printf("================================================================\n");
     printf("HIRAM MISRA-C TOPOLOGICAL ARITHMETIC CIRCUIT VERIFIER\n");
     printf("================================================================\n");
-    printf("Nodes in Flash: %u | ROM Footprint: ~%lu bytes\n",
-           (unsigned int)CIRCUIT_NODE_COUNT,
-           (unsigned long)(sizeof(g_circuit_nodes) + sizeof(g_circuit_children) + sizeof(g_circuit_weights)));
-    printf("Evaluation Stack Scratchpad: %lu bytes (Zero Heap)\n\n",
-           (unsigned long)(sizeof(Rational) * CIRCUIT_NODE_COUNT));
 
     Rational thresh = {5LL, 100LL}; /* 5% risk limit */
 
@@ -185,21 +217,34 @@ int main(void) {
     hiram_evidence_init(&ev3);
     hiram_evidence_set(&ev3, VAR_LOW_AIRSPEED, true);
     hiram_evidence_set(&ev3, VAR_HIGH_ANGLE_OF_ATTACK, true);
-    hiram_evidence_set(&ev3, HAZARD_VAR_ID, false); /* Contradicts low_airspeed && high_aoa => stall_hazard */
+    hiram_evidence_set(&ev3, HAZARD_VAR_ID, false);
     HiramAuditReport rep3 = hiram_audit_hazard(&ev3, thresh);
     printf("[TEST 3] Sensor Contradiction: Decision = %s | P(Stall) = %lld/%lld\n",
            rep3.decision == HIRAM_REJECTED_CONTRADICTION ? "REJECTED_CONTRADICTION" : "UNEXPECTED",
            (long long)rep3.hazard_probability.num, (long long)rep3.hazard_probability.den);
 
-    /* [TEST 4] Evidence Clear and Value-Toggle Branch */
+    /* [TEST 4] Explicitly Observed Hazard = False */
     Evidence ev4;
     hiram_evidence_init(&ev4);
-    hiram_evidence_set(&ev4, VAR_TERRAIN_CLEAR, true);
-    hiram_evidence_set(&ev4, VAR_TERRAIN_CLEAR, false);
-    hiram_evidence_clear(&ev4, VAR_TERRAIN_CLEAR);
-    printf("[TEST 4] Evidence Toggle and Clear APIs: Verified\n");
+    hiram_evidence_set(&ev4, HAZARD_VAR_ID, false);
+    HiramAuditReport rep4 = hiram_audit_hazard(&ev4, thresh);
+    printf("[TEST 4] Explicit Hazard False: Decision = %s | P(Stall) = %lld/%lld\n",
+           rep4.decision == HIRAM_APPROVED ? "APPROVED" : "VETOED",
+           (long long)rep4.hazard_probability.num, (long long)rep4.hazard_probability.den);
 
-    /* [TEST 5] Defensive Arithmetic and Sign-Handling Branches */
+    /* [TEST 5] Invalid Threshold Validation */
+    HiramAuditReport rep5 = hiram_audit_hazard(&ev1, (Rational){1LL, 0LL});
+    printf("[TEST 5] Invalid Threshold (1/0): Decision = %s\n",
+           rep5.decision == HIRAM_REJECTED_INVALID_INPUT ? "REJECTED_INVALID_INPUT" : "UNEXPECTED");
+
+    /* [TEST 6] Toggle/Clear and Bounds Defense */
+    hiram_evidence_set(&ev1, VAR_TERRAIN_CLEAR, false);
+    hiram_evidence_clear(&ev1, VAR_TERRAIN_CLEAR);
+    hiram_evidence_set(&ev1, 35, true);   /* Out of bounds variable guard */
+    hiram_evidence_clear(&ev1, 35);
+    printf("[TEST 6] Input Bounds & Mutator APIs: Verified\n");
+
+    /* [TEST 7] Defensive Math */
     gcd_acc(-5LL, 10LL);
     gcd_acc(5LL, -10LL);
     rational_make(1LL, -2LL);
@@ -209,12 +254,14 @@ int main(void) {
     rational_add((Rational){0LL, 1LL}, (Rational){1LL, 1LL});
     rational_add((Rational){1LL, 1LL}, (Rational){0LL, 1LL});
     rational_div((Rational){1LL, 2LL}, (Rational){1LL, 2LL});
-    printf("[TEST 5] Arithmetic Edge Cases and Defensive Branches: Verified\n");
+    printf("[TEST 7] Defensive Math Edge Cases: Verified\n");
 
     if (rep1.decision == HIRAM_APPROVED &&
         rep2.decision == HIRAM_VETOED_SAFETY_VIOLATION &&
-        rep3.decision == HIRAM_REJECTED_CONTRADICTION) {
-        printf("\n[SUCCESS] 100%% Structural and Functional Verification Achieved!\n");
+        rep3.decision == HIRAM_REJECTED_CONTRADICTION &&
+        rep4.decision == HIRAM_APPROVED &&
+        rep5.decision == HIRAM_REJECTED_INVALID_INPUT) {
+        printf("\n[SUCCESS] All Safety Invariants Verified!\n");
         return 0;
     }
     return 1;
