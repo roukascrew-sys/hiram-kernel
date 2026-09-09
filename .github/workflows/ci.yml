@@ -161,8 +161,20 @@ jobs:
       - name: Install ARM toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi binutils-arm-none-eabi
+          sudo apt-get install -y --no-install-recommends             gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
           arm-none-eabi-gcc --version | head -1
+          # The link needs libc.a: GCC emits memcpy/memset for the .data copy
+          # loop in Reset_Handler and for the Evidence struct copies in
+          # hiram_audit_hazard_vector. Debian splits that into libnewlib, which
+          # --no-install-recommends does not pull in. Fail loudly here rather
+          # than as an undefined reference three steps later.
+          MULTI=$(arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -print-multi-directory)
+          echo "multilib: $MULTI"
+          arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -print-file-name=libc.a
+          case "$(arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -print-file-name=libc.a)" in
+            /*) echo "libc.a resolved" ;;
+            *)  echo "::error::libc.a not found for multilib $MULTI"; exit 1 ;;
+          esac
       - name: Compile kernel (strict, with stack usage)
         run: |
           mkdir -p tmp_test_build
