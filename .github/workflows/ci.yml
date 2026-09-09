@@ -195,32 +195,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install ARM toolchain
+      # Arm's own release rather than Debian packaging. Removes apt from the
+      # equation after it installed cleanly once and then failed twice with no
+      # change to the step, and pins CI to the same 14.2.Rel1 the author builds
+      # with locally. Arm's tarball bundles newlib, so libc.a -- which the link
+      # genuinely needs for the memcpy/memset GCC emits -- is always present.
+      - name: Install Arm GNU Toolchain 14.2.Rel1 (pinned, checksum verified)
         run: |
-          # Transient apt index/mirror failures on hosted runners are common
-          # enough to be worth retrying: this exact step passed in 118s and then
-          # failed in 9s on the next run with no change to it.
+          set -euo pipefail
+          VER=14.2.rel1
+          TARBALL="arm-gnu-toolchain-${VER}-x86_64-arm-none-eabi.tar.xz"
+          URL="https://developer.arm.com/-/media/Files/downloads/gnu/${VER}/binrel/${TARBALL}"
+          # Published by Arm at ${URL}.sha256asc
+          SHA256=62a63b981fe391a9cbad7ef51b17e49aeaa3e7b0d029b36ca1e9c3b2a9b78823
           for attempt in 1 2 3; do
-            if sudo apt-get update && sudo apt-get install -y --no-install-recommends                  gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi; then
-              echo "toolchain installed on attempt $attempt"; break
-            fi
-            if [ "$attempt" = 3 ]; then
-              echo "::error::ARM toolchain install failed after 3 attempts"; exit 1
-            fi
-            echo "attempt $attempt failed, retrying"; sleep 10
+            if curl -fsSL --retry 3 --retry-delay 5 -o "$TARBALL" "$URL"; then break; fi
+            if [ "$attempt" = 3 ]; then echo "::error::toolchain download failed"; exit 1; fi
+            echo "download attempt $attempt failed, retrying"; sleep 10
           done
+          echo "${SHA256}  ${TARBALL}" | sha256sum -c -
+          sudo mkdir -p /opt/arm
+          sudo tar -xJf "$TARBALL" -C /opt/arm
+          # Discover the bin directory rather than assuming the archive layout.
+          BINDIR="$(find /opt/arm -maxdepth 3 -type d -name bin | head -1)"
+          if [ -z "$BINDIR" ]; then echo "::error::no bin/ in extracted toolchain"; exit 1; fi
+          echo "$BINDIR" >> "$GITHUB_PATH"
+          echo "toolchain on PATH: $BINDIR"
+      - name: Verify toolchain resolves libc for the cortex-m7 multilib
+        run: |
+          set -euo pipefail
           arm-none-eabi-gcc --version | head -1
-          # The link needs libc.a: GCC emits memcpy/memset for the .data copy
-          # loop in Reset_Handler and for the Evidence struct copies in
-          # hiram_audit_hazard_vector. Debian splits that into libnewlib, which
-          # --no-install-recommends does not pull in. Fail loudly here rather
-          # than as an undefined reference three steps later.
-          MULTI=$(arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -print-multi-directory)
-          echo "multilib: $MULTI"
-          arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -print-file-name=libc.a
-          case "$(arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -print-file-name=libc.a)" in
-            /*) echo "libc.a resolved" ;;
-            *)  echo "::error::libc.a not found for multilib $MULTI"; exit 1 ;;
+          echo "multilib: $(arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -print-multi-directory)"
+          LIBC="$(arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -print-file-name=libc.a)"
+          case "$LIBC" in
+            /*) echo "libc.a: $LIBC" ;;
+            *)  echo "::error::libc.a unresolved -- the firmware link will fail"; exit 1 ;;
           esac
       - name: Compile kernel (strict, with stack usage)
         run: |
