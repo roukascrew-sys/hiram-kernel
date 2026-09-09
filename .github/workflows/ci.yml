@@ -197,8 +197,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ARM toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends             gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
+          # Transient apt index/mirror failures on hosted runners are common
+          # enough to be worth retrying: this exact step passed in 118s and then
+          # failed in 9s on the next run with no change to it.
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends                  gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi; then
+              echo "toolchain installed on attempt $attempt"; break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::ARM toolchain install failed after 3 attempts"; exit 1
+            fi
+            echo "attempt $attempt failed, retrying"; sleep 10
+          done
           arm-none-eabi-gcc --version | head -1
           # The link needs libc.a: GCC emits memcpy/memset for the .data copy
           # loop in Reset_Handler and for the Evidence struct copies in
