@@ -29,9 +29,12 @@ int main(void) {
     hiram_evidence_set(&ev, VAR_ALTITUDE_STABLE, true);
     Rational risk_threshold = {5LL, 100LL};
 
+    HiramContext ctx;
+    hiram_context_init(&ctx);
+
     /* Warm-up L1 instruction cache */
     for (int i = 0; i < 500; i++) {
-        volatile HiramAuditReport r = hiram_audit_hazard(&ev, risk_threshold);
+        volatile HiramAuditReport r = hiram_audit_hazard(&ev, risk_threshold, &ctx);
         (void)r;
     }
 
@@ -47,7 +50,7 @@ int main(void) {
             hiram_evidence_clear(&ev, VAR_LOW_AIRSPEED);
         }
 
-        volatile HiramAuditReport rep = hiram_audit_hazard(&ev, risk_threshold);
+        volatile HiramAuditReport rep = hiram_audit_hazard(&ev, risk_threshold, &ctx);
         (void)rep;
 
         QueryPerformanceCounter(&end);

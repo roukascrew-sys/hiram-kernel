@@ -27,3 +27,8 @@ Desktop.ini
 *.elf
 *.bin
 *_m7.o
+*.su
+
+.test_*
+
+tmp_test_*

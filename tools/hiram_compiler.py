@@ -1,5 +1,5 @@
 from fractions import Fraction
-from hiram_ac import Circuit, eval_node, eval_evidence, NODE_LITERAL, NODE_PROD, NODE_SUM
+from hiram_ac import Circuit, eval_node, eval_evidence, NodeType, NODE_LITERAL, NODE_PROD, NODE_SUM
 
 FLIGHT_VAR_NAMES = [
     "terrain_clear",          # 0
@@ -18,10 +18,7 @@ FLIGHT_VAR_NAMES = [
 
 class Clause:
     def __init__(self, literals=None):
-        if literals is None:
-            self.literals = ()
-        else:
-            self.literals = tuple(literals)
+        self.literals = tuple(literals) if literals is not None else ()
 
     @classmethod
     def from_or(cls, literals):
@@ -33,22 +30,60 @@ class Clause:
             if v == var_id:
                 lit_is_true = (not is_neg) if val else is_neg
                 if lit_is_true:
-                    return None
+                    return None  # Clause satisfied
             else:
                 new_lits.append((v, is_neg))
         return Clause(new_lits)
 
 class Rule:
-    """Implication rule AST: antecedent(s) => consequent."""
-    def __init__(self, antecedents=None, consequent=None, antecedent=None, **kwargs):
-        self.antecedents = antecedents if antecedents is not None else antecedent
-        self.antecedent = self.antecedents
-        self.consequent = consequent if consequent is not None else kwargs.get('consequence', None)
-        for k, v in kwargs.items():
-            setattr(self, k, v)
+    """Strict Implication Rule: Antecedents => Consequent."""
+    def __init__(self, antecedents, consequent):
+        self.antecedents = tuple(antecedents)
+        self.consequent = consequent
 
-    def __repr__(self):
-        return f"Rule({self.antecedents} => {self.consequent})"
+    def to_clause(self, var_to_id):
+        # A1 and A2 => C  <=>  ~A1 or ~A2 or C
+        lits = []
+        for ant in self.antecedents:
+            if isinstance(ant, tuple) and len(ant) == 2:
+                var, is_neg = ant
+                vid = var_to_id[var] if isinstance(var, str) else var
+                lits.append((vid, not bool(is_neg)))
+            else:
+                vid = var_to_id[ant] if isinstance(ant, str) else ant
+                lits.append((vid, True))  # Antecedent positive -> negated in clause
+
+        if isinstance(self.consequent, tuple) and len(self.consequent) == 2:
+            var, is_neg = self.consequent
+            vid = var_to_id[var] if isinstance(var, str) else var
+            lits.append((vid, bool(is_neg)))
+        else:
+            vid = var_to_id[self.consequent] if isinstance(self.consequent, str) else self.consequent
+            lits.append((vid, False))  # Consequent positive -> positive in clause
+
+        return Clause.from_or(lits)
+
+CANONICAL_PRIORS = {
+    "terrain_clear": Fraction(99, 100),
+    "altitude_stable": Fraction(95, 100),
+    "descent_permitted": Fraction(1, 2),
+    "low_airspeed": Fraction(1, 20),
+    "high_angle_of_attack": Fraction(1, 10),
+    "stall_hazard": Fraction(1, 100),
+    "freezing_temp": Fraction(1, 5),
+    "high_humidity": Fraction(1, 3),
+    "icing_hazard": Fraction(1, 50),
+    "high_g_load": Fraction(1, 50),
+    "airframe_stress": Fraction(1, 4),
+    "structural_hazard": Fraction(1, 500)
+}
+
+CANONICAL_RULES = [
+    Rule(["terrain_clear", "altitude_stable"], "descent_permitted"),
+    Rule(["low_airspeed", "high_angle_of_attack"], "stall_hazard"),
+    Rule(["freezing_temp", "high_humidity"], "icing_hazard"),
+    Rule(["high_g_load", "airframe_stress"], "structural_hazard")
+]
 
 class VarMap(dict):
     """Dictionary mapping variable names to IDs with integer fallback."""
@@ -67,170 +102,70 @@ class VarMap(dict):
         return default
 
 class CompiledKB(tuple):
-    """Subclass of tuple (circuit, root) providing backward-compatible evaluation methods."""
-    def __new__(cls, circuit, root, variables=None, priors=None, clauses=None, var_to_id=None, id_to_var=None, rules=None):
+    def __new__(cls, circuit, root, variables, priors, clauses, var_to_id, id_to_var, rules):
         return super().__new__(cls, (circuit, root))
 
-    def __init__(self, circuit, root, variables=None, priors=None, clauses=None, var_to_id=None, id_to_var=None, rules=None):
+    def __init__(self, circuit, root, variables, priors, clauses, var_to_id, id_to_var, rules):
         self.circuit = circuit
         self.root = root
         self.root_id = root
-        self.variables = variables or []
-        self.priors = priors or {}
-        self.clauses = clauses or []
-        self.rules = rules or []
-        self.var_to_id = var_to_id if var_to_id is not None else VarMap()
-        self.id_to_var = id_to_var if id_to_var is not None else {}
+        self.variables = variables
+        self.priors = priors
+        self.clauses = clauses
+        self.var_to_id = var_to_id
+        self.id_to_var = id_to_var
+        self.rules = rules
 
-    def _to_dict(self, ev):
-        if isinstance(ev, dict):
-            res = {}
-            for k, v in ev.items():
-                kid = self.var_to_id.get(k, k) if isinstance(k, str) else k
-                res[kid] = bool(v)
-            return res
+    def _normalize_evidence(self, ev):
+        norm = {}
         if hasattr(ev, 'observed_mask') and hasattr(ev, 'values_mask'):
-            d = {}
             for v in range(32):
                 if ev.observed_mask & (1 << v):
-                    d[v] = bool(ev.values_mask & (1 << v))
-            return d
-        if hasattr(ev, 'contents'):
-            e = ev.contents
-            d = {}
-            for v in range(32):
-                if e.observed_mask & (1 << v):
-                    d[v] = bool(e.values_mask & (1 << v))
-            return d
-        if isinstance(ev, (list, tuple)):
-            d = {}
-            for item in ev:
-                if isinstance(item, (list, tuple)) and len(item) == 2:
-                    k, v = item
-                    kid = self.var_to_id.get(k, k) if isinstance(k, str) else k
-                    d[kid] = bool(v)
-            return d
-        return ev
+                    norm[v] = bool(ev.values_mask & (1 << v))
+            return norm
+
+        items = ev.items() if isinstance(ev, dict) else ev
+        for k, val in items:
+            if isinstance(val, str):
+                raise TypeError(f"Evidence value for '{k}' must be boolean, got string '{val}'")
+            if not isinstance(val, (bool, int)):
+                raise TypeError(f"Evidence value for '{k}' must be boolean, got {type(val)}")
+
+            if isinstance(k, str):
+                if k not in self.var_to_id:
+                    raise KeyError(f"Unknown flight variable name: '{k}'")
+                vid = self.var_to_id[k]
+            else:
+                vid = int(k)
+                if vid not in self.id_to_var:
+                    raise KeyError(f"Unknown flight variable ID: {vid}")
+            norm[vid] = bool(val)
+        return norm
 
     def eval_evidence(self, ev):
-        return eval_node(self.circuit, self.root, self._to_dict(ev))
+        return eval_node(self.circuit, self.root, self._normalize_evidence(ev))
 
     def eval_node(self, ev):
-        return eval_node(self.circuit, self.root, self._to_dict(ev))
+        return self.eval_evidence(ev)
 
     def eval(self, ev):
-        return eval_node(self.circuit, self.root, self._to_dict(ev))
-
-    def query(self, ev):
-        return eval_node(self.circuit, self.root, self._to_dict(ev))
-
-    def __call__(self, ev):
-        return eval_node(self.circuit, self.root, self._to_dict(ev))
-
-def _extract_rule_components(r):
-    if isinstance(r, Clause):
-        return None, None, r
-    if hasattr(r, 'literals'):
-        return None, None, Clause(r.literals)
-
-    ant = None
-    cons = None
-    for a in ['antecedents', 'antecedent', 'premises', 'premise', 'conditions', 'condition', 'body', 'lhs', 'inputs', 'causes', 'if_vars']:
-        if hasattr(r, a):
-            ant = getattr(r, a)
-            break
-    for c in ['consequent', 'consequence', 'conclusions', 'conclusion', 'head', 'rhs', 'action', 'outcome', 'result', 'output', 'then_var', 'effect', 'hazard']:
-        if hasattr(r, c):
-            cons = getattr(r, c)
-            break
-
-    if ant is None or cons is None:
-        props = {}
-        if hasattr(r, '__dict__'):
-            props.update(r.__dict__)
-        for k in dir(r):
-            if not k.startswith('_') and k not in props:
-                try:
-                    v = getattr(r, k)
-                    if not callable(v):
-                        props[k] = v
-                except Exception:
-                    pass
-        for k, v in props.items():
-            kl = k.lower()
-            if ant is None and any(w in kl for w in ['ant', 'prem', 'cond', 'body', 'lhs', 'in', 'if', 'cause']):
-                ant = v
-            elif cons is None and any(w in kl for w in ['cons', 'concl', 'head', 'rhs', 'out', 'then', 'effect', 'hazard']):
-                cons = v
-
-        if ant is None or cons is None:
-            iters = [v for v in props.values() if isinstance(v, (list, tuple, set))]
-            scalars = [v for v in props.values() if isinstance(v, (str, int, bool))]
-            if iters and scalars:
-                ant = iters[0]
-                cons = scalars[0]
-
-    if (ant is None or cons is None) and isinstance(r, (list, tuple)):
-        if len(r) == 2:
-            ant, cons = r[0], r[1]
-        elif len(r) == 3 and all(isinstance(x, (int, str)) for x in r):
-            ant, cons = r[:2], r[2]
-
-    return ant, cons, None
-
-def _rule_to_clause(r, var_to_id):
-    ant, cons, clause = _extract_rule_components(r)
-    if clause is not None:
-        return clause
-
-    if ant is None or cons is None:
-        raise TypeError(f"Cannot parse rule object of type {type(r)}: {r!r}")
-
-    lits = []
-    if isinstance(ant, (list, tuple, set)):
-        for a in ant:
-            if isinstance(a, (list, tuple)) and len(a) == 2:
-                var, is_neg = a
-                vid = var_to_id[var]
-                lits.append((vid, is_neg))
-            else:
-                vid = var_to_id[a]
-                lits.append((vid, True))
-    else:
-        vid = var_to_id[ant]
-        lits.append((vid, True))
-
-    if isinstance(cons, (list, tuple)) and len(cons) == 2 and isinstance(cons[1], bool):
-        var, is_neg = cons
-        vid = var_to_id[var]
-        lits.append((vid, is_neg))
-    elif isinstance(cons, (list, tuple, set)) and len(cons) == 1:
-        c = list(cons)[0]
-        vid = var_to_id[c]
-        lits.append((vid, False))
-    else:
-        vid = var_to_id[cons]
-        lits.append((vid, False))
-
-    return Clause.from_or(lits)
+        return self.eval_evidence(ev)
 
 def compile_circuit(variables, priors, clauses):
     if not variables:
         raise ValueError("Variables list cannot be empty")
-
     var_set = set(variables)
     if len(var_set) != len(variables):
-        raise ValueError("Duplicate variable ID in variables list")
+        raise ValueError("Duplicate variable ID detected")
 
     for v in variables:
         if v not in priors:
             raise KeyError(f"Variable {v} missing prior probability")
-
     for v, p in priors.items():
         if v not in var_set:
             raise ValueError(f"Prior declared for undeclared variable {v}")
         if p < 0 or p > 1:
-            raise ValueError(f"Prior probability for variable {v} must be in [0, 1], got {p}")
+            raise ValueError(f"Prior for variable {v} must be in [0, 1], got {p}")
 
     for c in clauses:
         for v, _ in c.literals:
@@ -253,18 +188,17 @@ def compile_circuit(variables, priors, clauses):
     def build(var_idx, current_clauses):
         if any(len(c.literals) == 0 for c in current_clauses):
             return None
-
         if var_idx == len(variables):
             return true_node
 
         v = variables[var_idx]
         p = priors[v]
-
         clause_key = tuple(sorted(tuple(sorted(c.literals)) for c in current_clauses))
         key = (var_idx, clause_key)
         if key in memo:
             return memo[key]
 
+        # Condition on v = True
         c_true = []
         true_dead = False
         for c in current_clauses:
@@ -276,6 +210,7 @@ def compile_circuit(variables, priors, clauses):
                 c_true.append(cond)
         true_child = None if true_dead else build(var_idx + 1, c_true)
 
+        # Condition on v = False
         c_false = []
         false_dead = False
         for c in current_clauses:
@@ -293,15 +228,11 @@ def compile_circuit(variables, priors, clauses):
 
         branches = []
         weights = []
-
         if true_child is not None:
-            prod_true = circuit.add_node(NODE_PROD, children=[lit_nodes[(v, False)], true_child])
-            branches.append(prod_true)
+            branches.append(circuit.add_node(NODE_PROD, children=[lit_nodes[(v, False)], true_child]))
             weights.append(p)
-
         if false_child is not None:
-            prod_false = circuit.add_node(NODE_PROD, children=[lit_nodes[(v, True)], false_child])
-            branches.append(prod_false)
+            branches.append(circuit.add_node(NODE_PROD, children=[lit_nodes[(v, True)], false_child]))
             weights.append(1 - p)
 
         sum_node = circuit.add_node(NODE_SUM, children=branches, weights=weights)
@@ -312,24 +243,13 @@ def compile_circuit(variables, priors, clauses):
     return circuit, root
 
 def compile_from_rules(*args, **kwargs):
-    variables = kwargs.get('variables', None)
-    priors = kwargs.get('priors', None)
-    rules = kwargs.get('rules', None)
-
-    if len(args) == 1:
-        rules = args[0]
-    elif len(args) == 2:
-        rules, priors = args
-    elif len(args) >= 3:
-        if isinstance(args[0], (list, tuple)) and len(args[0]) > 0 and isinstance(args[0][0], int):
-            variables, priors, rules = args[:3]
-        else:
-            rules, priors, variables = args[:3]
+    rules = args[0] if len(args) >= 1 else kwargs.get('rules', CANONICAL_RULES)
+    priors = args[1] if len(args) >= 2 else kwargs.get('priors', CANONICAL_PRIORS)
+    variables = args[2] if len(args) >= 3 else kwargs.get('variables', None)
 
     if priors is None:
         raise ValueError("Priors must be provided")
 
-    # Maintain natural declaration order from priors.keys()
     if variables is None:
         raw_vars = list(priors.keys())
     else:
@@ -337,22 +257,39 @@ def compile_from_rules(*args, **kwargs):
 
     var_to_id = VarMap()
     id_to_var = {}
-
     for i, v in enumerate(raw_vars):
         if isinstance(v, str):
             var_to_id[v] = i
             id_to_var[i] = v
         else:
-            var_to_id[v] = v
-            id_to_var[v] = v
+            name = FLIGHT_VAR_NAMES[v] if v < len(FLIGHT_VAR_NAMES) else f"var_{v}"
+            var_to_id[name] = v
+            id_to_var[v] = name
 
-    int_variables = [var_to_id[v] for v in raw_vars]
-    int_priors = {var_to_id[k]: p for k, p in priors.items()}
+    int_variables = [var_to_id[v] if isinstance(v, str) else v for v in raw_vars]
+    int_priors = {var_to_id[k] if isinstance(k, str) else k: p for k, p in priors.items()}
 
-    parsed_clauses = []
-    if rules is not None:
-        for r in rules:
-            parsed_clauses.append(_rule_to_clause(r, var_to_id))
+    clauses = []
+    parsed_rules = []
+    for r in (rules or []):
+        if isinstance(r, Rule):
+            rule_obj = r
+        elif isinstance(r, (list, tuple)) and len(r) == 2:
+            rule_obj = Rule(r[0], r[1])
+        elif isinstance(r, (list, tuple)) and len(r) == 3 and all(isinstance(x, (str, int)) for x in r):
+            rule_obj = Rule(r[:2], r[2])
+        elif isinstance(r, Clause):
+            clauses.append(r)
+            parsed_rules.append(r)
+            continue
+        else:
+            raise TypeError(f"Cannot parse rule specification: {r}")
 
-    circuit, root = compile_circuit(int_variables, int_priors, parsed_clauses)
-    return CompiledKB(circuit, root, raw_vars, priors, parsed_clauses, var_to_id, id_to_var, rules)
+        clauses.append(rule_obj.to_clause(var_to_id))
+        parsed_rules.append(rule_obj)
+
+    circuit, root = compile_circuit(int_variables, int_priors, clauses)
+    return CompiledKB(circuit, root, raw_vars, priors, clauses, var_to_id, id_to_var, parsed_rules)
+
+def build_reference_kb():
+    return compile_from_rules(CANONICAL_RULES, CANONICAL_PRIORS)

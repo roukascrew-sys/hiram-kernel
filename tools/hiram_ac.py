@@ -1,8 +1,14 @@
 from fractions import Fraction
+from enum import IntEnum
 
-NODE_LITERAL = 0
-NODE_PROD = 1
-NODE_SUM = 2
+class NodeType(IntEnum):
+    NODE_LITERAL = 0
+    NODE_PROD = 1
+    NODE_SUM = 2
+
+NODE_LITERAL = NodeType.NODE_LITERAL
+NODE_PROD = NodeType.NODE_PROD
+NODE_SUM = NodeType.NODE_SUM
 
 class Circuit:
     def __init__(self):
@@ -10,7 +16,7 @@ class Circuit:
 
     def add_node(self, node_type, **kwargs):
         nid = len(self.nodes)
-        node = {'id': nid, 'type': node_type, **kwargs}
+        node = {'id': nid, 'type': int(node_type), **kwargs}
         self.nodes.append(node)
         return nid
 

@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,11 +58,35 @@ typedef struct {
     Rational      hazard_threshold;
 } HiramAuditReport;
 
+#ifndef CIRCUIT_NODE_COUNT
+#define CIRCUIT_NODE_COUNT 81
+#endif
+
+typedef struct {
+    Rational memo[CIRCUIT_NODE_COUNT];
+    uint32_t execution_flags;
+} HiramContext;
+
+#define MONITORED_HAZARDS_COUNT 3
+
+typedef struct {
+    HiramDecision overall_decision;
+    uint32_t      veto_mask;
+    Rational      hazard_posteriors[MONITORED_HAZARDS_COUNT];
+    Rational      hazard_thresholds[MONITORED_HAZARDS_COUNT];
+} HiramVectorReport;
+
 void hiram_evidence_init(Evidence* ev);
 void hiram_evidence_set(Evidence* ev, uint16_t var_id, bool val);
 void hiram_evidence_clear(Evidence* ev, uint16_t var_id);
-Rational hiram_eval_evidence(const Evidence* ev);
-HiramAuditReport hiram_audit_hazard(const Evidence* base_ev, Rational max_acceptable_risk);
+void hiram_context_init(HiramContext* ctx);
+Rational hiram_eval_evidence(const Evidence* ev, HiramContext* ctx);
+HiramAuditReport hiram_audit_hazard(const Evidence* base_ev, Rational max_acceptable_risk, HiramContext* ctx);
+HiramVectorReport hiram_audit_hazard_vector(
+    const Evidence* base_ev,
+    const Rational  thresholds[MONITORED_HAZARDS_COUNT],
+    HiramContext*   ctx
+);
 
 #ifdef __cplusplus
 }

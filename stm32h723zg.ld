@@ -60,6 +60,16 @@ SECTIONS
         _ebss = .;
     } > DTCM
 
+    /* DTCM scratchpad and context section (zero-wait-state RAM) */
+    /* DTCM scratchpad and context section (zero-wait-state RAM) */
+    .dtcm_data :
+    {
+        . = ALIGN(8);
+        KEEP(*(.dtcm_data))
+        KEEP(*(.dtcm_data*))
+        . = ALIGN(8);
+    } > DTCM
+
     /* Discard unused unwind frames */
     /DISCARD/ :
     {

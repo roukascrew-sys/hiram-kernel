@@ -100,8 +100,12 @@ static void delay_ms(volatile uint32_t count) {
 /* -----------------------------------------------------------------------------
  * Target Entry Point & Flight Scenarios
  * ----------------------------------------------------------------------------- */
+__attribute__((section(".dtcm_data"), aligned(8)))
+static HiramContext g_hiram_ctx;
+
 void target_main(void) {
     hw_init();
+    hiram_context_init(&g_hiram_ctx);
 
     uart_puts("\n\n================================================================\n");
     uart_puts("  HIRAM FLIGHT SAFETY KERNEL - STM32H723ZG (CORTEX-M7)\n");
@@ -126,7 +130,7 @@ void target_main(void) {
         hiram_evidence_set(&ev1, VAR_ALTITUDE_STABLE, true);
 
         uint32_t t0 = DWT_CYCCNT;
-        HiramAuditReport rep1 = hiram_audit_hazard(&ev1, thresh);
+        HiramAuditReport rep1 = hiram_audit_hazard(&ev1, thresh, &g_hiram_ctx);
         uint32_t t1 = DWT_CYCCNT;
         uint32_t cycles1 = t1 - t0;
 
@@ -143,7 +147,7 @@ void target_main(void) {
         hiram_evidence_set(&ev2, VAR_HIGH_ANGLE_OF_ATTACK, true);
 
         t0 = DWT_CYCCNT;
-        HiramAuditReport rep2 = hiram_audit_hazard(&ev2, thresh);
+        HiramAuditReport rep2 = hiram_audit_hazard(&ev2, thresh, &g_hiram_ctx);
         t1 = DWT_CYCCNT;
         uint32_t cycles2 = t1 - t0;
 
@@ -161,7 +165,7 @@ void target_main(void) {
         hiram_evidence_set(&ev3, HAZARD_VAR_ID, false);
 
         t0 = DWT_CYCCNT;
-        HiramAuditReport rep3 = hiram_audit_hazard(&ev3, thresh);
+        HiramAuditReport rep3 = hiram_audit_hazard(&ev3, thresh, &g_hiram_ctx);
         t1 = DWT_CYCCNT;
         uint32_t cycles3 = t1 - t0;
 
