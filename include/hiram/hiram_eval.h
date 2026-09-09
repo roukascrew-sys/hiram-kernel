@@ -2,13 +2,12 @@
 #define HIRAM_EVAL_H
 
 /*
- * MinGW-w64 CRT Header Defense:
- * Suppresses conflicting '__int128' typedef in _mingw.h when -U__SIZEOF_INT128__ is passed.
+ * Accumulator width is selected in hiram_eval.c via HIRAM_FORCE_64BIT_ACC.
+ * This header deliberately defines no compiler-reserved identifiers: defining
+ * names in the implementation's reserved namespace (C99 7.1.3) is undefined
+ * behaviour, and the previous __SIZEOF_INT128__ override also silently
+ * disabled the 128-bit accumulator it claimed to be protecting.
  */
-#if (defined(__MINGW32__) || defined(__MINGW64__)) && !defined(__SIZEOF_INT128__)
-#define __SIZEOF_INT128__ 16
-#define __HIRAM_FORCED_64BIT__ 1
-#endif
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -58,8 +57,12 @@ typedef struct {
     Rational      hazard_threshold;
 } HiramAuditReport;
 
+/* No default node count on purpose. A default would let one translation unit
+   size HiramContext.memo smaller than the node count the kernel writes into --
+   a silent cross-module buffer overflow that no single-file diagnostic catches.
+   Include hiram_circuit_data.h; it defines the dimensions then includes this. */
 #ifndef CIRCUIT_NODE_COUNT
-#define CIRCUIT_NODE_COUNT 81
+#error "Include hiram_circuit_data.h (not hiram_eval.h) to obtain CIRCUIT_NODE_COUNT."
 #endif
 
 typedef struct {

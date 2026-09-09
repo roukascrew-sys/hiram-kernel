@@ -3,14 +3,18 @@
 #ifndef HIRAM_CIRCUIT_DATA_H
 #define HIRAM_CIRCUIT_DATA_H
 
-#include "hiram_eval.h"
-
+/* Circuit dimensions are defined BEFORE including hiram_eval.h so that
+   HiramContext.memo is sized from the authoritative generated value.
+   hiram_eval.h carries no default: a translation unit that allocates a
+   HiramContext without this header fails to compile rather than silently
+   building a context smaller than the kernel writes into. */
 #define CIRCUIT_NODE_COUNT   81
 #define CIRCUIT_ROOT_ID      80
 #define HAZARD_VAR_ID        5
 #define CHILDREN_ARRAY_SIZE  108
 #define WEIGHTS_ARRAY_SIZE   36
 
+#include "hiram_eval.h"
 
 
 

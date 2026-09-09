@@ -2,8 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <windows.h>
-#include "hiram_eval.h"
-#include "hiram_circuit_data.h"
+#include "hiram_circuit_data.h"   /* defines circuit dimensions, then includes hiram_eval.h */
 
 #define NUM_TRIALS 10000
 
