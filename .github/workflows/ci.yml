@@ -1,0 +1,221 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The build the project claims to hold to. Kept in one place so a job cannot
+  # quietly drop a flag and still look green.
+  STRICT: >-
+    -std=c99 -Wall -Wextra -Werror -Wconversion -Wsign-conversion -Wshadow
+    -Wcast-align -Wcast-qual -Wswitch-enum -Wundef -Wformat=2 -pedantic-errors
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The generated circuit tables must be reproducible from the model. This was
+  # once checked by a script that copied the files and compared them to
+  # themselves, so it could not fail. Regenerating and diffing against the
+  # committed artifact is the version that can.
+  # ---------------------------------------------------------------------------
+  reproducibility:
+    name: Generated tables reproduce
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Regenerate circuit tables from the compiled model
+        run: PYTHONPATH=tools python tools/hiram_c_exporter.py
+      - name: Committed tables must be byte-identical to regenerated ones
+        run: git diff --exit-code -- include/hiram/hiram_circuit_data.h
+
+  # ---------------------------------------------------------------------------
+  # Both accumulator widths. The 64-bit fallback is a real code path, and a
+  # rename once left it selected by a flag no test passed any more.
+  # ---------------------------------------------------------------------------
+  strict-build:
+    name: Strict C99 (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: __int128 accumulator
+            flags: ""
+          - label: int64 accumulator
+            flags: "-DHIRAM_FORCE_64BIT_ACC"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile kernel
+        run: gcc $STRICT ${{ matrix.flags }} -O2 -Iinclude -Iinclude/hiram -c src/hiram_eval.c -o /tmp/hiram_eval.o
+      - name: Compile exhaustive sweep driver
+        run: gcc $STRICT ${{ matrix.flags }} -O2 -Iinclude -Iinclude/hiram src/hiram_eval.c tests/sanitizer_sweep.c -o /tmp/sweep
+      - name: Run sweep
+        run: /tmp/sweep
+      - name: A context must not be allocatable from hiram_eval.h alone
+        run: |
+          printf '#include "hiram_eval.h"\nHiramContext c;\nint main(void){return (int)sizeof c;}\n' > /tmp/lonely.c
+          if gcc -std=c99 -Iinclude -Iinclude/hiram -c /tmp/lonely.c -o /tmp/lonely.o 2>/dev/null; then
+            echo "::error::hiram_eval.h accepted a HiramContext allocation without the generated header"
+            exit 1
+          fi
+          echo "correctly refused"
+
+  # ---------------------------------------------------------------------------
+  # Undefined behaviour and memory errors across every evidence configuration.
+  # This has never run on the author's Windows toolchain, which ships no
+  # libubsan; the out-of-tree harness skipped it and still reported a pass.
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: UBSan + ASan exhaustive sweep
+    runs-on: ubuntu-latest
+    env:
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build instrumented (__int128 accumulator)
+        run: |
+          gcc -std=c99 -g -O1 -fsanitize=undefined,address -fno-sanitize-recover=all \
+              -Iinclude -Iinclude/hiram src/hiram_eval.c tests/sanitizer_sweep.c -o /tmp/sweep_asan
+      - name: Sweep, __int128 accumulator
+        run: /tmp/sweep_asan
+      - name: Build instrumented (int64 accumulator)
+        run: |
+          gcc -std=c99 -g -O1 -DHIRAM_FORCE_64BIT_ACC -fsanitize=undefined,address -fno-sanitize-recover=all \
+              -Iinclude -Iinclude/hiram src/hiram_eval.c tests/sanitizer_sweep.c -o /tmp/sweep_asan64
+      - name: Sweep, int64 accumulator
+        run: /tmp/sweep_asan64
+
+  # ---------------------------------------------------------------------------
+  # Python vs C differential, both the scalar and the multi-hazard vector API.
+  # ---------------------------------------------------------------------------
+  differential:
+    name: Python/C differential suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Scalar differential suite
+        run: python tests/test_c_binding.py
+      - name: Multi-hazard vector API suite
+        run: python tests/test_vector_binding.py
+
+  # ---------------------------------------------------------------------------
+  # The Python trusted kernel. Standard library only, so no install step beyond
+  # pytest itself -- if this job ever needs another dependency, that is a signal
+  # worth noticing rather than papering over.
+  # ---------------------------------------------------------------------------
+  invariant-engine:
+    name: Invariant engine (813 tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip pytest
+      - name: Module self-tests
+        run: |
+          cd invariant_engine
+          python harness_generators.py
+          python invariant_engine.py
+      - name: Test suite
+        run: python -m pytest invariant_engine -q
+      - name: Kernel must not import its own fixtures
+        working-directory: invariant_engine
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          out = subprocess.run(
+              [sys.executable, "-c",
+               "import sys, invariant_engine; print('harness_generators' in sys.modules)"],
+              capture_output=True, text=True, check=True)
+          assert out.stdout.strip() == "False", out.stdout
+          print("kernel imports no fixtures")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Cross-compile for the real target. The link step is the load-bearing part:
+  # the linker script asserts the stack cannot collide with the DTCM context, so
+  # a failure here means the memory budget no longer closes.
+  # ---------------------------------------------------------------------------
+  arm-firmware:
+    name: ARM Cortex-M7 firmware
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi binutils-arm-none-eabi
+          arm-none-eabi-gcc --version | head -1
+      - name: Compile kernel (strict, with stack usage)
+        run: |
+          mkdir -p tmp_test_build
+          cd tmp_test_build
+          arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -O3 -fstack-usage $STRICT \
+            -I../include -I../include/hiram -c ../src/hiram_eval.c -o hiram_eval_m7.o
+      - name: Compile target startup
+        run: |
+          arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -O3 -Iinclude -Iinclude/hiram \
+            -c src/target_main.c -o tmp_test_build/target_main_m7.o
+      - name: Link firmware (stack-reserve ASSERT must hold)
+        run: |
+          arm-none-eabi-gcc -T stm32h723zg.ld -nostartfiles -mcpu=cortex-m7 -mthumb \
+            -Wl,--gc-sections -Wl,-Map=tmp_test_build/hiram_firmware.map \
+            tmp_test_build/hiram_eval_m7.o tmp_test_build/target_main_m7.o -lgcc \
+            -o tmp_test_build/hiram_firmware.elf
+      - name: Report size and stack usage
+        run: |
+          arm-none-eabi-size tmp_test_build/hiram_firmware.elf
+          echo "--- -fstack-usage ---"
+          cat tmp_test_build/*.su
+      - name: Worst-case call-chain stack budget
+        run: |
+          python - <<'PY'
+          import glob, pathlib
+          su = {}
+          for path in glob.glob("tmp_test_build/*.su"):
+              for line in pathlib.Path(path).read_text().splitlines():
+                  parts = line.split("\t")
+                  if len(parts) >= 2:
+                      su[parts[0].split(":")[-1]] = int(parts[1])
+          # Frames nest: GCC outlines the evaluator body and reaches it with a
+          # bl, so the per-function .su figures do not compose on their own.
+          chains = {
+              "hiram_eval_evidence": ["hiram_eval_evidence", "hiram_eval_evidence.part.0"],
+              "hiram_audit_hazard": ["hiram_audit_hazard", "hiram_eval_evidence", "hiram_eval_evidence.part.0"],
+              "hiram_audit_hazard_vector": ["hiram_audit_hazard_vector", "hiram_eval_evidence", "hiram_eval_evidence.part.0"],
+          }
+          worst = 0
+          for name, chain in chains.items():
+              total = sum(su.get(f, 0) for f in chain)
+              worst = max(worst, total)
+              print(f"{name:<30} {total:>5} bytes")
+          BUDGET = 1024
+          print(f"\ndeepest chain: {worst} bytes (budget {BUDGET})")
+          if worst > BUDGET:
+              raise SystemExit(f"::error::stack budget exceeded: {worst} > {BUDGET}")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arm-firmware
+          path: |
+            tmp_test_build/hiram_firmware.elf
+            tmp_test_build/hiram_firmware.map
+            tmp_test_build/*.su
+          if-no-files-found: error
