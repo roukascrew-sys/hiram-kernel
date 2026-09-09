@@ -216,9 +216,13 @@ jobs:
           echo "${SHA256}  ${TARBALL}" | sha256sum -c -
           sudo mkdir -p /opt/arm
           sudo tar -xJf "$TARBALL" -C /opt/arm
-          # Discover the bin directory rather than assuming the archive layout.
-          BINDIR="$(find /opt/arm -maxdepth 3 -type d -name bin | head -1)"
-          if [ -z "$BINDIR" ]; then echo "::error::no bin/ in extracted toolchain"; exit 1; fi
+          # Locate the driver itself, not a directory called bin: the archive
+          # has two, and the inner arm-none-eabi/bin holds ar/as/ld but no
+          # arm-none-eabi-gcc, so matching on the directory name can put the
+          # wrong one on PATH.
+          GCC="$(find /opt/arm -maxdepth 4 -type f -name arm-none-eabi-gcc | head -1)"
+          if [ -z "$GCC" ]; then echo "::error::arm-none-eabi-gcc not found in extracted toolchain"; exit 1; fi
+          BINDIR="$(dirname "$GCC")"
           echo "$BINDIR" >> "$GITHUB_PATH"
           echo "toolchain on PATH: $BINDIR"
       - name: Verify toolchain resolves libc for the cortex-m7 multilib
