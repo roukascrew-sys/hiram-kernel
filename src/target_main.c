@@ -18,6 +18,23 @@
 #define GPIOD_OSPEEDR       (*(volatile uint32_t *)(GPIOD_BASE + 0x008))
 #define GPIOD_AFRH          (*(volatile uint32_t *)(GPIOD_BASE + 0x024))
 
+/* Clock tree. Every value below is marked with the register field it drives so
+   it can be checked against RM0468 (STM32H72x/H73x) without reading the code.
+   None of it has been executed on hardware -- see clock_init(). */
+#define RCC_CR              (*(volatile uint32_t *)(RCC_BASE + 0x000))
+#define RCC_CFGR            (*(volatile uint32_t *)(RCC_BASE + 0x010))
+#define RCC_D1CFGR          (*(volatile uint32_t *)(RCC_BASE + 0x018))
+#define RCC_D2CFGR          (*(volatile uint32_t *)(RCC_BASE + 0x01C))
+#define RCC_PLLCKSELR       (*(volatile uint32_t *)(RCC_BASE + 0x028))
+#define RCC_PLLCFGR         (*(volatile uint32_t *)(RCC_BASE + 0x02C))
+#define RCC_PLL1DIVR        (*(volatile uint32_t *)(RCC_BASE + 0x030))
+
+#define PWR_BASE            0x58024800UL
+#define PWR_D3CR            (*(volatile uint32_t *)(PWR_BASE + 0x018))
+
+#define FLASH_BASE          0x52002000UL
+#define FLASH_ACR           (*(volatile uint32_t *)(FLASH_BASE + 0x000))
+
 #define USART3_BASE         0x40004800UL
 #define USART3_CR1          (*(volatile uint32_t *)(USART3_BASE + 0x000))
 #define USART3_BRR          (*(volatile uint32_t *)(USART3_BASE + 0x00C))
@@ -31,7 +48,94 @@
 #define DWT_LAR             (*(volatile uint32_t *)0xE0001FB0UL) /* Software Lock Access */
 
 /* -----------------------------------------------------------------------------
- * Serial Output (USART3: PD8 = TX, 115200 Baud @ 64 MHz HSI Default Clock)
+ * Clock configuration
+ *
+ * The firmware previously ran on the 64 MHz HSI default with no PLL setup at
+ * all, so every DWT figure it produced was at 64 MHz -- not the 550 MHz the part
+ * is capable of, and not a configuration anyone would fly. Converting those
+ * cycle counts at the headline rate would have understated latency by 8.6x.
+ *
+ * Target here is a deliberately conservative 200 MHz CPU clock from the HSI, so
+ * the measurement needs no external oscillator and no board solder-bridge
+ * configuration.
+ *
+ *   HSI 64 MHz / DIVM1 8 = 8 MHz reference  (PLL1RGE = 8-16 MHz range)
+ *   8 MHz * DIVN1 50     = 400 MHz VCO      (wide VCO range, 192-836 MHz)
+ *   400 MHz / DIVP1 2    = 200 MHz SYSCLK
+ *   D1CPRE /1            = 200 MHz CPU  (what DWT_CYCCNT counts)
+ *   HPRE   /2            = 100 MHz AHB
+ *   D2PPRE1 /2           =  50 MHz APB1 (USART3 kernel clock)
+ *
+ * FAIL-SAFE: every wait is bounded, and any timeout leaves the part on the HSI
+ * and reports it over UART. A wrong constant here therefore costs a slower,
+ * clearly-labelled measurement rather than a board that will not boot -- which
+ * matters because none of this has been run on hardware.
+ *
+ * NOT VALIDATED ON SILICON. Check the register offsets and field positions
+ * against RM0468 before trusting a 200 MHz figure; if the PLL fails to lock the
+ * banner will say so and the numbers remain valid at 64 MHz.
+ * ----------------------------------------------------------------------------- */
+#define HSI_HZ              64000000u
+#define PLL_DIVM1           8u      /* RCC_PLLCKSELR DIVM1  */
+#define PLL_DIVN1           50u     /* RCC_PLL1DIVR  DIVN1  */
+#define PLL_DIVP1           2u      /* RCC_PLL1DIVR  DIVP1  */
+#define TARGET_SYSCLK_HZ    ((HSI_HZ / PLL_DIVM1) * PLL_DIVN1 / PLL_DIVP1)
+#define CLOCK_TIMEOUT       200000u
+
+static uint32_t g_cpu_hz  = HSI_HZ;
+static uint32_t g_pclk1_hz = HSI_HZ;
+static const char *g_clock_note = "HSI 64 MHz (PLL not engaged)";
+
+static bool wait_bit(volatile uint32_t *reg, uint32_t mask, bool want_set) {
+    for (uint32_t i = 0u; i < CLOCK_TIMEOUT; i++) {
+        bool is_set = ((*reg & mask) != 0u);
+        if (is_set == want_set) { return true; }
+    }
+    return false;
+}
+
+static void clock_init(void) {
+    /* Highest voltage scale first: raising the clock before the core voltage
+       is the ordering that hangs the part. VOS1 = 0b11 in PWR_D3CR[15:14]. */
+    PWR_D3CR |= (3u << 14);
+    if (!wait_bit(&PWR_D3CR, (1u << 13), true)) { return; }   /* VOSRDY */
+
+    /* Flash latency is set generously on purpose. Too many wait states only
+       costs speed; too few at 200 MHz is a bus fault. 4 WS, WRHIGHFREQ 0b10. */
+    FLASH_ACR = (4u << 0) | (2u << 4);
+
+    if (!wait_bit(&RCC_CR, (1u << 2), true)) { return; }       /* HSIRDY */
+
+    /* PLL1 source HSI (PLLSRC 0b00), DIVM1 in bits [9:4]. */
+    RCC_PLLCKSELR = (PLL_DIVM1 << 4);
+
+    /* PLL1RGE 0b11 (8-16 MHz input), PLL1VCOSEL 0 (wide), DIVP1 output on. */
+    RCC_PLLCFGR = (3u << 2) | (1u << 16);
+
+    /* DIVN1 in [8:0] and DIVP1 in [15:9], both stored as value-1. */
+    RCC_PLL1DIVR = ((PLL_DIVN1 - 1u) << 0) | ((PLL_DIVP1 - 1u) << 9);
+
+    /* Bus dividers before the switch, so nothing is overclocked mid-flight. */
+    RCC_D1CFGR = (8u << 0);      /* HPRE /2 (0b1000); D1CPRE /1 */
+    RCC_D2CFGR = (4u << 4);      /* D2PPRE1 /2 (0b100) */
+
+    RCC_CR |= (1u << 24);                                     /* PLL1ON */
+    if (!wait_bit(&RCC_CR, (1u << 25), true)) { return; }      /* PLL1RDY */
+
+    RCC_CFGR = (RCC_CFGR & ~7u) | 3u;                         /* SW = PLL1 */
+    for (uint32_t i = 0u; i < CLOCK_TIMEOUT; i++) {
+        if (((RCC_CFGR >> 3) & 7u) == 3u) {                   /* SWS == PLL1 */
+            g_cpu_hz = TARGET_SYSCLK_HZ;
+            g_pclk1_hz = TARGET_SYSCLK_HZ / 4u;               /* HPRE/2, D2PPRE1/2 */
+            g_clock_note = "PLL1 200 MHz from HSI";
+            return;
+        }
+    }
+    /* Switch did not take: the HSI is still driving the core. */
+}
+
+/* -----------------------------------------------------------------------------
+ * Serial Output (USART3: PD8 = TX, 115200 Baud, divisor derived from PCLK1)
  * ----------------------------------------------------------------------------- */
 static void hw_init(void) {
     /* 1. Enable GPIOB, GPIOD, and USART3 clocks */
@@ -49,9 +153,11 @@ static void hw_init(void) {
     GPIOD_AFRH    &= ~(0xFu << 0);
     GPIOD_AFRH    |=  (7u << 0);          /* AF7 = USART3_TX */
 
-    /* 4. Configure USART3: 64,000,000 / 115,200 = 556 (0x022C) */
+    /* 4. Configure USART3. The divisor follows whatever clock_init() actually
+          achieved, so the console stays readable on either the PLL or the HSI
+          fallback rather than assuming 64 MHz. */
     USART3_CR1 = 0;
-    USART3_BRR = 556;
+    USART3_BRR = g_pclk1_hz / 115200u;
     USART3_CR1 = (1u << 0) | (1u << 3);   /* UE (Enable), TE (Transmitter) */
 
     /* 5. Enable Cortex-M7 DWT Cycle Counter */
@@ -88,6 +194,40 @@ static void uart_print_u32(uint32_t val) {
     uart_puts(&buf[i + 1]);
 }
 
+static void uart_print_u32_pad(uint32_t val, uint32_t width) {
+    uint32_t div = 1u;
+    for (uint32_t k = 1u; k < width; k++) { div *= 10u; }
+    while (div > 0u) {
+        uint32_t digit = (val / div) % 10u;
+        uart_putc((char)('0' + (int)digit));
+        div /= 10u;
+    }
+}
+
+/* Report a DWT cycle count as cycles, wall time, and share of the control
+   frame. The harness used to print raw cycles only, which is meaningless
+   without the clock they were counted at -- and the clock was not printed
+   either, so a capture could be converted at the wrong rate with nothing in
+   the log to contradict it. */
+static void uart_print_timing(uint32_t cycles) {
+    uint64_t ns = ((uint64_t)cycles * 1000000000ULL) / (uint64_t)g_cpu_hz;
+    uint32_t us_int = (uint32_t)(ns / 1000ULL);
+    uint32_t us_frac = (uint32_t)(ns % 1000ULL);
+    uint32_t pct_x100 = (uint32_t)(ns / 250ULL);   /* of a 2.5 ms / 400 Hz frame */
+
+    uart_print_u32(cycles);
+    uart_puts(" cyc = ");
+    uart_print_u32(us_int);
+    uart_putc('.');
+    uart_print_u32_pad(us_frac, 3u);
+    uart_puts(" us = ");
+    uart_print_u32(pct_x100 / 100u);
+    uart_putc('.');
+    uart_print_u32_pad(pct_x100 % 100u, 2u);
+    uart_puts("% of frame");
+}
+
+
 static void delay_ms(volatile uint32_t count) {
     while (count--) {
         for (volatile uint32_t i = 0; i < 8000; i++) {
@@ -103,12 +243,22 @@ __attribute__((section(".dtcm_data"), aligned(8)))
 static HiramContext g_hiram_ctx;
 
 void target_main(void) {
+    clock_init();
     hw_init();
     hiram_context_init(&g_hiram_ctx);
 
     uart_puts("\n\n================================================================\n");
     uart_puts("  HIRAM FLIGHT SAFETY KERNEL - STM32H723ZG (CORTEX-M7)\n");
     uart_puts("  Zero-Heap MISRA-C Safety Monitor Online | DWT Active\n");
+    uart_puts("================================================================\n");
+    uart_puts("  Clock  : ");
+    uart_puts(g_clock_note);
+    uart_puts("\n  CPU    : ");
+    uart_print_u32(g_cpu_hz / 1000000u);
+    uart_puts(" MHz  (DWT_CYCCNT counts at this rate)\n");
+    uart_puts("  Frame  : 400 Hz = 2500 us = ");
+    uart_print_u32(g_cpu_hz / 400u);
+    uart_puts(" cycles\n");
     uart_puts("================================================================\n\n");
 
     Rational thresh = {5LL, 100LL}; /* 5% safety veto threshold */
@@ -135,8 +285,8 @@ void target_main(void) {
 
         uart_puts("Test 1 (Nominal):      Decision = ");
         uart_puts(rep1.decision == HIRAM_APPROVED ? "APPROVED" : "VETOED");
-        uart_puts("  | Cycles = ");
-        uart_print_u32(cycles1);
+        uart_puts("  | ");
+        uart_print_timing(cycles1);
         uart_puts("\n");
 
         /* [TEST 2] Severe Stall Hazard Injected */
@@ -152,8 +302,8 @@ void target_main(void) {
 
         uart_puts("Test 2 (Stall Hazard): Decision = ");
         uart_puts(rep2.decision == HIRAM_VETOED_SAFETY_VIOLATION ? "VETOED" : "APPROVED");
-        uart_puts("    | Cycles = ");
-        uart_print_u32(cycles2);
+        uart_puts("    | ");
+        uart_print_timing(cycles2);
         uart_puts("\n");
 
         /* [TEST 3] Sensor Contradiction Injected */
@@ -170,8 +320,8 @@ void target_main(void) {
 
         uart_puts("Test 3 (Contradiction):Decision = ");
         uart_puts(rep3.decision == HIRAM_REJECTED_CONTRADICTION ? "REJECTED" : "UNEXPECTED");
-        uart_puts("  | Cycles = ");
-        uart_print_u32(cycles3);
+        uart_puts("  | ");
+        uart_print_timing(cycles3);
         uart_puts("\n\n");
 
         delay_ms(1000); /* 1-second cadence between audit frames */
