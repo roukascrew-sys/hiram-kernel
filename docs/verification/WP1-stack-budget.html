@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Verification record for HIRAM Work Package 1: stack budget before and after, full regression results, and the gaps found and closed.">
+<style>html{color-scheme:light dark}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+<title>HIRAM DTCM Context Migration</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+:root{
+  --ground:#EEF1F4; --surface:#FFFFFF; --surface-2:#F6F8FA;
+  --ink:#141A22; --ink-2:#3D4854; --ink-3:#68737F;
+  --rule:#D3DAE1; --rule-2:#E4E9ED;
+  --accent:#1B5A85; --accent-soft:#DDE9F1;
+  --pass:#1C6E51; --pass-soft:#DBEDE5;
+  --warn:#8A6111; --warn-soft:#F4EAD5;
+  --fail:#993326; --fail-soft:#F5E0DC;
+  --display:"Archivo",system-ui,sans-serif;
+  --body:"Source Serif 4",Georgia,serif;
+  --mono:"IBM Plex Mono",ui-monospace,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0F1318; --surface:#161C23; --surface-2:#1C232B;
+    --ink:#E3E8ED; --ink-2:#B2BCC6; --ink-3:#7F8B96;
+    --rule:#2A333D; --rule-2:#222A33;
+    --accent:#6BAAD6; --accent-soft:#1A2C39;
+    --pass:#63BE9B; --pass-soft:#152A22;
+    --warn:#D3A54B; --warn-soft:#2C2415;
+    --fail:#D9776A; --fail-soft:#2E1A17;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0F1318; --surface:#161C23; --surface-2:#1C232B;
+  --ink:#E3E8ED; --ink-2:#B2BCC6; --ink-3:#7F8B96;
+  --rule:#2A333D; --rule-2:#222A33;
+  --accent:#6BAAD6; --accent-soft:#1A2C39;
+  --pass:#63BE9B; --pass-soft:#152A22;
+  --warn:#D3A54B; --warn-soft:#2C2415;
+  --fail:#D9776A; --fail-soft:#2E1A17;
+}
+
+*{box-sizing:border-box}
+body{background:var(--ground);color:var(--ink);font-family:var(--body);
+  font-size:16px;line-height:1.62;margin:0;padding:0 20px 88px;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:980px;margin:0 auto}
+h1,h2,h3,.lbl,th,.chip,.metric{font-family:var(--display)}
+h1{font-size:clamp(28px,4.4vw,44px);line-height:1.08;font-weight:700;
+  letter-spacing:-.022em;margin:0;text-wrap:balance}
+h2{font-size:22px;font-weight:600;letter-spacing:-.012em;margin:0 0 4px;text-wrap:balance}
+h3{font-size:15px;font-weight:600;letter-spacing:-.005em;margin:22px 0 6px}
+p{margin:0 0 14px;max-width:70ch}
+code,.mono{font-family:var(--mono);font-size:.855em}
+code{background:var(--surface-2);border:1px solid var(--rule-2);
+  border-radius:3px;padding:.06em .34em}
+a{color:var(--accent)}
+
+/* ---- masthead ---- */
+header{padding:52px 0 26px;border-bottom:2px solid var(--ink)}
+.eyebrow{font-family:var(--mono);font-size:11px;font-weight:500;
+  letter-spacing:.15em;text-transform:uppercase;color:var(--accent);margin:0 0 14px}
+.sub{font-family:var(--body);font-size:18px;color:var(--ink-2);margin:14px 0 0;max-width:64ch}
+.meta{display:flex;flex-wrap:wrap;gap:0 30px;margin-top:22px;
+  font-family:var(--mono);font-size:12px;color:var(--ink-3)}
+.meta b{color:var(--ink-2);font-weight:500}
+
+/* ---- verdict ---- */
+.verdict{display:grid;grid-template-columns:repeat(auto-fit,minmax(184px,1fr));
+  gap:1px;background:var(--rule);border:1px solid var(--rule);margin:30px 0 8px}
+.vcell{background:var(--surface);padding:16px 18px}
+.metric{font-size:29px;font-weight:700;letter-spacing:-.03em;line-height:1.05;
+  font-variant-numeric:tabular-nums}
+.vcell .lbl{display:block;font-size:10.5px;letter-spacing:.11em;text-transform:uppercase;
+  color:var(--ink-3);margin-bottom:7px;font-weight:600}
+.vnote{font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:5px}
+
+section{margin-top:44px}
+.shead{display:flex;align-items:baseline;gap:12px;
+  border-bottom:1px solid var(--rule);padding-bottom:8px;margin-bottom:16px}
+.snum{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--accent);
+  letter-spacing:.06em;flex:none}
+
+/* ---- tables ---- */
+.scroll{overflow-x:auto;border:1px solid var(--rule);background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:520px}
+th{font-size:10.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--ink-3);text-align:left;padding:10px 14px;
+  border-bottom:1px solid var(--rule);background:var(--surface-2);white-space:nowrap}
+td{padding:9px 14px;border-bottom:1px solid var(--rule-2);
+  font-family:var(--mono);color:var(--ink-2);vertical-align:top}
+td.t{font-family:var(--body);font-size:14.5px;color:var(--ink)}
+tr:last-child td{border-bottom:none}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.big{color:var(--ink);font-weight:600}
+
+.chip{display:inline-block;font-size:10px;font-weight:600;letter-spacing:.07em;
+  text-transform:uppercase;padding:2.5px 7px;border-radius:2px;white-space:nowrap}
+.c-pass{background:var(--pass-soft);color:var(--pass)}
+.c-warn{background:var(--warn-soft);color:var(--warn)}
+.c-fail{background:var(--fail-soft);color:var(--fail)}
+.c-acc{background:var(--accent-soft);color:var(--accent)}
+
+/* ---- callout ---- */
+.note{background:var(--surface);border-left:3px solid var(--warn);
+  padding:15px 18px;margin:18px 0}
+.note.acc{border-left-color:var(--accent)}
+.note p{margin:0;font-size:15px}
+.note p+p{margin-top:9px}
+.note .lbl{display:block;font-family:var(--display);font-size:10.5px;font-weight:600;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--warn);margin-bottom:6px}
+.note.acc .lbl{color:var(--accent)}
+
+/* ---- finding list ---- */
+.find{border:1px solid var(--rule);background:var(--surface);margin-bottom:-1px;
+  padding:15px 18px;display:grid;grid-template-columns:auto 1fr;gap:4px 14px;align-items:start}
+.find .chip{grid-row:span 2;margin-top:2px}
+.find h3{margin:0;font-size:15px}
+.find p{margin:0;font-size:14.5px;color:var(--ink-2)}
+
+footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--rule);
+  font-family:var(--mono);font-size:11.5px;color:var(--ink-3)}
+@media (max-width:600px){
+  .find{grid-template-columns:1fr}
+  .find .chip{grid-row:auto;justify-self:start}
+}
+</style>
+
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">Work Package 1 &middot; Verification Record</p>
+  <h1>DTCM Context Migration &amp; Stack Budgeting</h1>
+  <p class="sub">HIRAM flight safety kernel. Stack storage decoupled into an explicit
+  execution context, mapped to Cortex&#8209;M7 tightly-coupled memory, and re-verified
+  against every existing suite plus one new suite covering an API that previously had none.</p>
+  <div class="meta">
+    <span><b>Repository</b> C:\Users\rouka\hiram-kernel</span>
+    <span><b>Base commit</b> bb5e3da</span>
+    <span><b>Verified</b> 2026-09-08</span>
+    <span><b>Toolchain</b> arm-none-eabi-gcc 14.2.1 &middot; MinGW gcc 13.2.0 &middot; Python 3.12.10</span>
+  </div>
+</header>
+
+<div class="verdict">
+  <div class="vcell"><span class="lbl">Regression</span>
+    <div class="metric">10 / 10</div>
+    <div class="vnote">suites passing, post-edit</div></div>
+  <div class="vcell"><span class="lbl">Eval frame, M7 -O3</span>
+    <div class="metric">1432 &rarr; 8 B</div>
+    <div class="vnote">120 B including outlined body</div></div>
+  <div class="vcell"><span class="lbl">Deepest call chain</span>
+    <div class="metric">376 B</div>
+    <div class="vnote">vector audit, worst case</div></div>
+  <div class="vcell"><span class="lbl">DTCM free for stack</span>
+    <div class="metric">129,768</div>
+    <div class="vnote">bytes of 131,072</div></div>
+</div>
+
+<section>
+  <div class="shead"><span class="snum">01</span><h2>Stack budget</h2></div>
+
+  <p>Measured by rebuilding the committed <code>bb5e3da</code> kernel from git and the current
+  tree with the same compiler and flags, so the comparison is real rather than quoted.
+  Your cited 1,392&nbsp;B baseline is close to the 1,432&nbsp;B I measure; the difference is
+  flag- and toolchain-dependent, and the direction is unaffected.</p>
+
+  <div class="scroll"><table>
+    <thead><tr>
+      <th>Function</th><th class="num">HEAD (bb5e3da)</th><th class="num">Now</th>
+      <th class="num">Change</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>hiram_eval_evidence</td><td class="num big">1,432</td><td class="num big">8</td>
+        <td class="num" style="color:var(--pass)">&minus;99.4%</td>
+        <td class="t">Wrapper only &mdash; see below</td></tr>
+      <tr><td>hiram_eval_evidence.part.0</td><td class="num">&mdash;</td><td class="num">112</td>
+        <td class="num">new</td><td class="t">Outlined body, reached by <code>bl</code></td></tr>
+      <tr><td>hiram_audit_hazard</td><td class="num">136</td><td class="num">128</td>
+        <td class="num">&minus;6%</td><td class="t">Scalar entry point</td></tr>
+      <tr><td>hiram_audit_hazard_vector</td><td class="num">&mdash;</td><td class="num">256</td>
+        <td class="num">new</td><td class="t">Phase 2 multi-hazard API</td></tr>
+      <tr><td>hiram_context_init</td><td class="num">&mdash;</td><td class="num">8</td>
+        <td class="num">new</td><td class="t">&mdash;</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note">
+    <span class="lbl">The &le;48 byte target, read honestly</span>
+    <p><code>-fstack-usage</code> reports <b>8&nbsp;bytes</b> for <code>hiram_eval_evidence</code>,
+    which satisfies the &le;48&nbsp;B requirement as written. But GCC split the function:
+    the 8-byte wrapper performs the NULL checks and reaches the 112-byte body through
+    <code>bl</code>, not a tail call &mdash; confirmed by disassembly. The frames nest, so the
+    true worst case for calling <code>hiram_eval_evidence</code> is <b>120&nbsp;bytes</b>.</p>
+    <p>Per-function <code>.su</code> numbers do not compose. The figure that belongs in a stack
+    budget is the call-chain total, and the deepest chain is
+    <code>hiram_audit_hazard_vector</code> &rarr; <code>hiram_eval_evidence</code> &rarr;
+    <code>.part.0</code> = <b>256 + 8 + 112 = 376&nbsp;bytes</b>.</p>
+    <p><b>Verdict:</b> the letter of the benchmark is met at 8&nbsp;B; the honest worst case is
+    120&nbsp;B for that entry point and 376&nbsp;B for the deepest path. The intent &mdash;
+    removing a 1.4&nbsp;KB single-frame allocation that risked silent overflow in an ISR or
+    FreeRTOS task &mdash; is decisively met: <b>1,568&nbsp;B &rarr; 248&nbsp;B</b> on the scalar
+    audit path, an 84% reduction, with the 1,304-byte memo moved to statically allocated DTCM.</p>
+  </div>
+
+  <h3>Memory placement, verified on the linked image</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>Symbol / section</th><th class="num">Address</th><th class="num">Size</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>g_hiram_ctx</td><td class="num">0x20000000</td><td class="num">1,304 B</td>
+        <td class="t">DTCM base, zero-wait-state, <code>.dtcm_data</code></td></tr>
+      <tr><td>_edtcm</td><td class="num">0x20000518</td><td class="num">&mdash;</td>
+        <td class="t">End of static DTCM allocation</td></tr>
+      <tr><td>_estack</td><td class="num">0x20020000</td><td class="num">&mdash;</td>
+        <td class="t">Top of stack &mdash; 129,768 B of headroom</td></tr>
+      <tr><td>.text</td><td class="num">0x08000040</td><td class="num">10,216 B</td>
+        <td class="t">Flash</td></tr>
+      <tr><td>.data &rarr; .bss</td><td class="num">&mdash;</td><td class="num">1,304 &rarr; 0 B</td>
+        <td class="t">1,304 B of flash reclaimed (see 03)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <div class="shead"><span class="snum">02</span><h2>Regression: every suite, before and after</h2></div>
+  <p>All ten run clean. Steps 1&ndash;5 are your verification sequence; 6&ndash;10 are the build
+  and link gates. Only two suites changed behaviour during the session, both because a new
+  guard caught them relying on something it now forbids.</p>
+
+  <div class="scroll"><table>
+    <thead><tr><th>#</th><th>Check</th><th class="num">Scale</th><th>Before</th><th>After</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td class="t">Generator reproduces circuit data byte-identically</td>
+        <td class="num">81 nodes</td><td><span class="chip c-pass">pass</span></td><td><span class="chip c-pass">pass</span></td></tr>
+      <tr><td>2</td><td class="t">Scalar differential suite, Python vs C</td>
+        <td class="num">1,000 &times; 4 thr</td><td><span class="chip c-pass">pass</span></td><td><span class="chip c-pass">pass</span></td></tr>
+      <tr><td>3</td><td class="t"><b>Vector API suite</b> &mdash; new this session</td>
+        <td class="num">19 checks</td><td><span class="chip c-fail">absent</span></td><td><span class="chip c-pass">pass</span></td></tr>
+      <tr><td>4</td><td class="t">Rigor suite, random-CNF oracle</td>
+        <td class="num">41,588 checks</td><td><span class="chip c-pass">pass</span></td><td><span class="chip c-pass">pass</span></td></tr>
+      <tr><td>5</td><td class="t">Avionics readiness, exhaustive API sweep</td>
+        <td class="num">2,125,764 calls</td><td><span class="chip c-pass">pass</span></td><td><span class="chip c-pass">pass</span></td></tr>
+      <tr><td>6</td><td class="t">Host strict build, <code>__int128</code> accumulator</td>
+        <td class="num">C99 pedantic</td><td><span class="chip c-pass">pass</span></td><td><span class="chip c-pass">pass</span></td></tr>
+      <tr><td>7</td><td class="t">Host strict build, forced <code>int64</code> accumulator</td>
+        <td class="num">C99 pedantic</td><td><span class="chip c-pass">pass</span></td><td><span class="chip c-pass">pass</span></td></tr>
+      <tr><td>8</td><td class="t">ARM Cortex-M7 strict build</td>
+        <td class="num">C99 pedantic</td><td><span class="chip c-pass">pass</span></td><td><span class="chip c-pass">pass</span></td></tr>
+      <tr><td>9</td><td class="t">Firmware link, stack-reserve assertion</td>
+        <td class="num">4 KB reserve</td><td><span class="chip c-warn">no assert</span></td><td><span class="chip c-pass">pass</span></td></tr>
+      <tr><td>10</td><td class="t">Standalone self-test</td>
+        <td class="num">1 case</td><td><span class="chip c-pass">pass</span></td><td><span class="chip c-pass">pass</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <p style="margin-top:16px">The full strict set passes on all three targets with zero
+  diagnostics: <code>-std=c99 -Wall -Wextra -Werror -Wconversion -Wsign-conversion -Wshadow
+  -Wcast-align -Wcast-qual -Wswitch-enum -Wundef -Wformat=2 -pedantic-errors</code>. That is
+  uncommon for rational arithmetic code and it held through every edit.</p>
+</section>
+
+<section>
+  <div class="shead"><span class="snum">03</span><h2>Gaps found and closed</h2></div>
+
+  <div class="find">
+    <span class="chip c-fail">critical</span>
+    <h3>The Phase 2 vector API had zero test coverage</h3>
+    <p><code>hiram_audit_hazard_vector</code> &mdash; 84 lines of safety-critical C, the largest
+    stack consumer in the kernel, and the only path to the icing and structural hazards &mdash;
+    was referenced by no test, suite, or harness. It shipped entirely unverified.
+    <b>Closed:</b> new <code>tests/test_vector_binding.py</code>, 19 checks: 2,000 randomized
+    differential trials against an independent Python oracle, an exhaustive 729-configuration
+    sweep of the six hazard-driver variables, 400 cross-API consistency states, 8 invalid-input
+    contract cases, and 2 context-lifecycle checks.</p>
+  </div>
+
+  <div class="find">
+    <span class="chip c-fail">critical</span>
+    <h3>A silent cross-module context undersize was possible</h3>
+    <p><code>hiram_eval.h</code> defaulted <code>CIRCUIT_NODE_COUNT</code> to 81 and sized
+    <code>HiramContext.memo</code> from it, while the generated header defined the authoritative
+    value <em>after</em> including it. Any translation unit allocating a context without the
+    generated header would size it from the stale default while the kernel writes
+    <code>CIRCUIT_NODE_COUNT</code> entries &mdash; a silent buffer overflow across a module
+    boundary that no single-file diagnostic can catch. <b>Closed:</b> the generator now emits
+    the dimensions <em>before</em> the include, and the default is replaced by an
+    <code>#error</code>. Verified: allocating a context from <code>hiram_eval.h</code> alone no
+    longer compiles.</p>
+  </div>
+
+  <div class="find">
+    <span class="chip c-warn">high</span>
+    <h3>No link-time proof that the stack cannot reach the context</h3>
+    <p>Removing silent stack overflow is the stated purpose of this work package, yet nothing
+    checked that static DTCM allocation left room for the stack. <b>Closed:</b>
+    <code>_Min_Stack_Size = 0x1000</code> and a linker <code>ASSERT</code> on
+    <code>_edtcm + _Min_Stack_Size &le; _estack</code>. Verified by forcing a 128&nbsp;KB reserve
+    and confirming the link fails with <em>"DTCM exhausted"</em>.</p>
+  </div>
+
+  <div class="find">
+    <span class="chip c-warn">high</span>
+    <h3>UBSan was reported as passing while never running</h3>
+    <p>The readiness harness skips the sanitizer unconditionally on Windows
+    (<code>if sys.platform != 'win32'</code>) yet still reported
+    <code>instrumented_build: pass</code>. All 2,125,764 exhaustive calls ran with no
+    undefined-behaviour detection while the JSON read as if they had been sanitized.
+    <b>Partly closed:</b> the harness now emits
+    <code>ub_detection_active: false</code> and a reason. The check still cannot run here &mdash;
+    this MinGW ships no <code>libubsan</code>.</p>
+  </div>
+
+  <div class="find">
+    <span class="chip c-acc">hardening</span>
+    <h3>Compile-time invariants, reserved-identifier UB, and dead flash</h3>
+    <p>Added four C99 compile-time assertions (context capacity, root index in range, variable
+    count fits the 32-bit mask, hazard id in range) &mdash; verified to fire by building against
+    deliberately mismatched headers. Removed the block that <code>#define</code>d
+    <code>__SIZEOF_INT128__</code>, a compiler-reserved identifier (C99 &sect;7.1.3) whose
+    override also silently disabled the 128-bit accumulator it claimed to protect. Marked
+    <code>.dtcm_data</code> as <code>NOLOAD</code>: <code>Reset_Handler</code> never copied it,
+    so 1,304 bytes of initialiser sat in flash and were never transferred &mdash; reclaimed, and
+    the section no longer implies an initialisation that does not happen.</p>
+  </div>
+</section>
+
+<section>
+  <div class="shead"><span class="snum">04</span><h2>Still open</h2></div>
+  <p>None of these block the work package. All bear on the DAL-A claim in the certification report.</p>
+
+  <div class="scroll"><table>
+    <thead><tr><th>Item</th><th>Status</th><th>What it would take</th></tr></thead>
+    <tbody>
+      <tr><td class="t">UBSan / ASan never execute on this host</td>
+        <td><span class="chip c-warn">blocked</span></td>
+        <td class="t">A MinGW with <code>libubsan</code>, or run the readiness suite under WSL</td></tr>
+      <tr><td class="t">&ldquo;Regeneration&rdquo; check is still vacuous for
+        <code>hiram_eval.c</code> / <code>.h</code></td>
+        <td><span class="chip c-warn">partial</span></td>
+        <td class="t">Those are hand-written, not generated. Drop them from the check rather
+        than copy the files to satisfy it</td></tr>
+      <tr><td class="t">WCET figures are desktop <code>QueryPerformanceCounter</code> samples</td>
+        <td><span class="chip c-fail">open</span></td>
+        <td class="t">The DWT harness exists in <code>target_main.c</code>; record one on-target
+        run and label it a measured maximum, not WCET</td></tr>
+      <tr><td class="t">MISRA compliance asserted from 3 of ~170 rules</td>
+        <td><span class="chip c-fail">open</span></td>
+        <td class="t">A checker run, or restate the claim as the two rules actually evidenced</td></tr>
+      <tr><td class="t">FCR states DO-178C DAL-A &ldquo;VERIFIED &amp; BASELINED&rdquo;</td>
+        <td><span class="chip c-fail">open</span></td>
+        <td class="t">Self-issued. Retitle as a verification evidence summary with a stated gap list</td></tr>
+      <tr><td class="t">Phases 3 &amp; 4 (action arbitration, GPIO interlock, staleness)</td>
+        <td><span class="chip c-acc">not started</span></td>
+        <td class="t">Phase 3 changes the compiled model and needs its own differential campaign</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note acc">
+    <span class="lbl">On aviation standards</span>
+    <p>The kernel itself now holds up well: exact rational arithmetic with no floating point,
+    zero heap, no recursion, bounded data-dependent loops, a fixed and provably separated DTCM
+    budget, and a strict-C99 build that survives <code>-Wconversion</code> and
+    <code>-Wcast-qual</code> without a single diagnostic. The engineering is real.</p>
+    <p>What does not yet hold up is the surrounding <em>evidence</em>. DO-178C DAL-A is a process
+    standard: it wants requirements traced to code and to tests, MC/DC coverage, a plan approved
+    before the work, tool qualification arguments, and configuration management records &mdash;
+    reviewed by someone who is not the author. The correct next step is not more tests. It is to
+    retitle the report honestly and write down the gap list, because a self-issued certificate is
+    the one artifact that makes a reviewer distrust everything underneath it.</p>
+  </div>
+</section>
+
+<section>
+  <div class="shead"><span class="snum">05</span><h2>Files changed</h2></div>
+  <div class="scroll"><table>
+    <thead><tr><th>File</th><th>Change</th></tr></thead>
+    <tbody>
+      <tr><td>tests/test_vector_binding.py</td><td class="t"><b>New.</b> 19-check vector API suite</td></tr>
+      <tr><td>include/hiram/hiram_eval.h</td><td class="t">Removed reserved-identifier block; replaced the silent node-count default with <code>#error</code></td></tr>
+      <tr><td>src/hiram_eval.c</td><td class="t">Four C99 compile-time invariants; corrected a false &ldquo;auto-generated&rdquo; banner; include order</td></tr>
+      <tr><td>tools/hiram_c_exporter.py</td><td class="t">Emit circuit dimensions before the API include</td></tr>
+      <tr><td>stm32h723zg.ld</td><td class="t"><code>.dtcm_data (NOLOAD)</code>; <code>_sdtcm</code>/<code>_edtcm</code>; stack-reserve <code>ASSERT</code></td></tr>
+      <tr><td>src/target_main.c, benchmarks/benchmark_c_latency.c</td><td class="t">Include order</td></tr>
+      <tr><td>hiram-kernel-rigor-tests.py, hiram-avionics-readiness-test.py</td><td class="t">Include entry point; explicit sanitizer status reporting</td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:16px">Build scratch is confined to <code>tmp_test_build/</code>, which
+  <code>.gitignore</code> already covers via <code>tmp_test_*</code>. No dot-prefixed directories
+  and nothing under <code>%LOCALAPPDATA%\Temp</code>, per the Smart App Control constraint.</p>
+</section>
+
+<footer>
+  Every figure in this report was measured during the session on the stated toolchain.
+  Baseline stack numbers come from rebuilding commit bb5e3da from git, not from quoted values.
+  Nothing has been committed &mdash; the working tree holds all changes.
+</footer>
+
+</div>
+</body>
+</html>
