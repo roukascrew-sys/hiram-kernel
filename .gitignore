@@ -32,3 +32,9 @@ Desktop.ini
 .test_*
 
 tmp_test_*
+
+# Released verification images are tracked on purpose: a recorded on-target
+# measurement has to identify exactly what was executed. See
+# docs/verification/dwt-capture-procedure.md for provenance and checksums.
+!docs/verification/firmware/*.bin
+!docs/verification/firmware/*.hex
