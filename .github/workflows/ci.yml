@@ -149,6 +149,43 @@ jobs:
           PY
 
   # ---------------------------------------------------------------------------
+  # Whole-system harnesses. These check the built kernel against oracles that
+  # share no code with the compiler or evaluator, so agreement is evidence
+  # rather than two implementations of one mistake. They lived outside the
+  # repository until now, which meant none of this ran anywhere but the author's
+  # machine -- and on Windows, Smart App Control blocks their freshly built
+  # executables intermittently, so "ran locally" was never a reliable claim.
+  # ---------------------------------------------------------------------------
+  harnesses:
+    name: Independent audit harnesses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Independent oracle over all 3**12 configurations
+        run: python harnesses/independent_audit.py .
+      - name: Rigor regression (41,588 random-CNF checks)
+        run: python harnesses/rigor_regression.py .
+      - name: Avionics readiness (2,125,764 API calls)
+        run: python harnesses/avionics_readiness.py .
+      - name: Confirm the sanitizer actually ran here
+        run: |
+          python - <<'PY'
+          import json, subprocess, sys
+          out = subprocess.run([sys.executable, "harnesses/avionics_readiness.py", "."],
+                               capture_output=True, text=True, check=True)
+          d = json.loads(out.stdout)
+          ib = d["instrumented_build"]
+          print("sanitizer:", ib.get("sanitizer"))
+          if not ib.get("ub_detection_active"):
+              raise SystemExit("::error::UB detection inactive on a Linux runner -- "
+                               "the sweep ran without sanitization")
+          print("undefined-behaviour detection was active")
+          PY
+
+  # ---------------------------------------------------------------------------
   # Cross-compile for the real target. The link step is the load-bearing part:
   # the linker script asserts the stack cannot collide with the DTCM context, so
   # a failure here means the memory budget no longer closes.

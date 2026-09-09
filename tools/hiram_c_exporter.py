@@ -88,12 +88,11 @@ def main():
 
     export_c_header(kb, target_path)
 
-    # If running in a test scratchpad directory, ensure headers match
-    if target_path.name == "hiram_circuit_data.h" and target_path.parent != (REPO_ROOT / "include/hiram"):
-        eval_c = (REPO_ROOT / "src/hiram_eval.c").read_bytes()
-        eval_h = (REPO_ROOT / "include/hiram/hiram_eval.h").read_bytes()
-        (out_dir / "hiram_eval.c").write_bytes(eval_c)
-        (out_dir / "hiram_eval.h").write_bytes(eval_h)
+    # Only hiram_circuit_data.h is generated. hiram_eval.c and hiram_eval.h are
+    # hand-written, and this used to copy them beside the generated header so a
+    # harness could "verify reproducibility" by diffing a copy against its own
+    # source -- a check that could not fail. Reproducibility is now claimed for
+    # the one artifact that is actually generated.
 
 if __name__ == "__main__":
     main()
