@@ -1,0 +1,20 @@
+### [2026-09-10 12:20] - Milestone M0/M1: Dual Reference Plant Oracle Qualification
+- **Commit Hash:** <run: git rev-parse --short HEAD>
+- **Hypothesis Tested:** Dual independent simulation oracles (closed-form kinematic integration vs. fixed-step RK4 with root bisection) must agree within 0.05 mm across 10,000 randomized dynamic profiles.
+- **What Failed / Was Rejected:**
+  - Initial implementation dropped commanded acceleration (a_cmd) during actuator delay (coasting assumption).
+  - RK4 solver artificially imported analytical stopping formula (t = v / b), destroying solver independence.
+  - Asymmetric zero-velocity boundary behavior caused 1.25 mm to 2.81 mm divergence when v0 = 0 and a_cmd != 0.
+  - Analytic solver froze cart position when command_time > 0.
+- **Rationale for Choice:**
+  - Replaced analytical coupling with numerical bisection to bracket zero-crossings to 1e-9 s.
+  - Standardized right-continuous acceleration reporting across phase boundaries.
+  - Enforced strict fail-closed contract validation (PlantOracleContractError / PlantOracleConvergenceError).
+  - Explicitly disentangled clearance violations (x > x_obs - 0.10 m) from physical contact (x >= x_obs).
+- **10th Man Red-Team Findings:**
+  - Auditor signed off on M0 kinematics with disagreement down to ~1e-13 m.
+  - Remediation patch closed all 10 initial audit blockers.
+- **Verified Metrics:**
+  - 8/8 test suites passing cleanly.
+  - 10,000-trial terminal disagreement: <= 0.05 mm (actual max observed: ~0.000000 mm).
+  - 1,000-trial RK4 step-halving convergence (dt=0.0002s vs dt=0.0001s): <= 10 microns.
