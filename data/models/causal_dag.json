@@ -1,0 +1,276 @@
+{
+  "schema_version": "1.0.0",
+  "topological_order": [
+    "TrackCondition",
+    "TrueObstacle",
+    "DecelCapability",
+    "LidarObs",
+    "TofObs",
+    "WheelSlipObs"
+  ],
+  "nodes": {
+    "TrackCondition": {
+      "name": "TrackCondition",
+      "states": [
+        "DRY",
+        "WET",
+        "ICY"
+      ],
+      "parents": [],
+      "cpt": [
+        0.7,
+        0.2,
+        0.1
+      ],
+      "cpt_hex": [
+        "0x1.6666666666666p-1",
+        "0x1.999999999999ap-3",
+        "0x1.999999999999ap-4"
+      ],
+      "parent_strides": {},
+      "own_state_stride": 1,
+      "total_parameters": 3,
+      "dropout_state_index": null,
+      "is_sensor_variable": false
+    },
+    "TrueObstacle": {
+      "name": "TrueObstacle",
+      "states": [
+        "CLEAR",
+        "BLOCKED"
+      ],
+      "parents": [
+        "TrackCondition"
+      ],
+      "cpt": [
+        0.95,
+        0.05,
+        0.9,
+        0.1,
+        0.85,
+        0.15
+      ],
+      "cpt_hex": [
+        "0x1.e666666666666p-1",
+        "0x1.999999999999ap-5",
+        "0x1.ccccccccccccdp-1",
+        "0x1.999999999999ap-4",
+        "0x1.b333333333333p-1",
+        "0x1.3333333333333p-3"
+      ],
+      "parent_strides": {
+        "TrackCondition": 2
+      },
+      "own_state_stride": 1,
+      "total_parameters": 6,
+      "dropout_state_index": null,
+      "is_sensor_variable": false
+    },
+    "DecelCapability": {
+      "name": "DecelCapability",
+      "states": [
+        "NOMINAL",
+        "DEGRADED",
+        "CRITICAL"
+      ],
+      "parents": [
+        "TrackCondition"
+      ],
+      "cpt": [
+        0.92,
+        0.07,
+        0.01,
+        0.2,
+        0.7,
+        0.1,
+        0.05,
+        0.35,
+        0.6
+      ],
+      "cpt_hex": [
+        "0x1.d70a3d70a3d71p-1",
+        "0x1.1eb851eb851ecp-4",
+        "0x1.47ae147ae147bp-7",
+        "0x1.999999999999ap-3",
+        "0x1.6666666666666p-1",
+        "0x1.999999999999ap-4",
+        "0x1.999999999999ap-5",
+        "0x1.6666666666666p-2",
+        "0x1.3333333333333p-1"
+      ],
+      "parent_strides": {
+        "TrackCondition": 3
+      },
+      "own_state_stride": 1,
+      "total_parameters": 9,
+      "dropout_state_index": null,
+      "is_sensor_variable": false
+    },
+    "LidarObs": {
+      "name": "LidarObs",
+      "states": [
+        "CLEAR",
+        "DETECTED",
+        "DROPOUT"
+      ],
+      "parents": [
+        "TrueObstacle"
+      ],
+      "cpt": [
+        0.98,
+        0.01,
+        0.01,
+        0.02,
+        0.95,
+        0.03
+      ],
+      "cpt_hex": [
+        "0x1.f5c28f5c28f5cp-1",
+        "0x1.47ae147ae147bp-7",
+        "0x1.47ae147ae147bp-7",
+        "0x1.47ae147ae147bp-6",
+        "0x1.e666666666666p-1",
+        "0x1.eb851eb851eb8p-6"
+      ],
+      "parent_strides": {
+        "TrueObstacle": 3
+      },
+      "own_state_stride": 1,
+      "total_parameters": 6,
+      "dropout_state_index": 2,
+      "is_sensor_variable": true
+    },
+    "TofObs": {
+      "name": "TofObs",
+      "states": [
+        "CLEAR",
+        "DETECTED",
+        "DROPOUT"
+      ],
+      "parents": [
+        "TrueObstacle"
+      ],
+      "cpt": [
+        0.96,
+        0.02,
+        0.02,
+        0.04,
+        0.92,
+        0.04
+      ],
+      "cpt_hex": [
+        "0x1.eb851eb851eb8p-1",
+        "0x1.47ae147ae147bp-6",
+        "0x1.47ae147ae147bp-6",
+        "0x1.47ae147ae147bp-5",
+        "0x1.d70a3d70a3d71p-1",
+        "0x1.47ae147ae147bp-5"
+      ],
+      "parent_strides": {
+        "TrueObstacle": 3
+      },
+      "own_state_stride": 1,
+      "total_parameters": 6,
+      "dropout_state_index": 2,
+      "is_sensor_variable": true
+    },
+    "WheelSlipObs": {
+      "name": "WheelSlipObs",
+      "states": [
+        "LOW",
+        "HIGH",
+        "DROPOUT"
+      ],
+      "parents": [
+        "DecelCapability"
+      ],
+      "cpt": [
+        0.95,
+        0.04,
+        0.01,
+        0.3,
+        0.68,
+        0.02,
+        0.05,
+        0.9,
+        0.05
+      ],
+      "cpt_hex": [
+        "0x1.e666666666666p-1",
+        "0x1.47ae147ae147bp-5",
+        "0x1.47ae147ae147bp-7",
+        "0x1.3333333333333p-2",
+        "0x1.5c28f5c28f5c3p-1",
+        "0x1.47ae147ae147bp-6",
+        "0x1.999999999999ap-5",
+        "0x1.ccccccccccccdp-1",
+        "0x1.999999999999ap-5"
+      ],
+      "parent_strides": {
+        "DecelCapability": 3
+      },
+      "own_state_stride": 1,
+      "total_parameters": 9,
+      "dropout_state_index": 2,
+      "is_sensor_variable": true
+    }
+  },
+  "loss_matrix": {
+    "actions": [
+      "ACCEL",
+      "COAST",
+      "EMERGENCY_BRAKE"
+    ],
+    "state_dependencies": [
+      "TrueObstacle",
+      "DecelCapability"
+    ],
+    "matrix": [
+      0.0,
+      0.0,
+      0.0,
+      500.0,
+      1000.0,
+      2000.0,
+      2.0,
+      2.0,
+      2.0,
+      100.0,
+      300.0,
+      800.0,
+      25.0,
+      25.0,
+      25.0,
+      5.0,
+      20.0,
+      50.0
+    ],
+    "matrix_hex": [
+      "0x0.0p+0",
+      "0x0.0p+0",
+      "0x0.0p+0",
+      "0x1.f400000000000p+8",
+      "0x1.f400000000000p+9",
+      "0x1.f400000000000p+10",
+      "0x1.0000000000000p+1",
+      "0x1.0000000000000p+1",
+      "0x1.0000000000000p+1",
+      "0x1.9000000000000p+6",
+      "0x1.2c00000000000p+8",
+      "0x1.9000000000000p+9",
+      "0x1.9000000000000p+4",
+      "0x1.9000000000000p+4",
+      "0x1.9000000000000p+4",
+      "0x1.4000000000000p+2",
+      "0x1.4000000000000p+4",
+      "0x1.9000000000000p+5"
+    ],
+    "action_stride": 6,
+    "dependency_strides": {
+      "TrueObstacle": 3,
+      "DecelCapability": 1
+    },
+    "total_parameters": 18
+  },
+  "digest": "ffe27d9f87ea5aa9260d805b56db348969bed0aeeb177c3c70d77d3439e25d76"
+}
