@@ -61,25 +61,50 @@ class TestScenarioGenerator(unittest.TestCase):
         self.assertAlmostEqual(marginal_band / 2000.0, 0.40, delta=0.05)
         self.assertAlmostEqual(open_band / 2000.0, 0.30, delta=0.05)
 
-    def test_canonical_stratum_counts_and_all_twelve_strata_logic(self):
+    def test_all_twelve_strata_physical_parameters(self):
+        """Auditor check: assert explicit physical behavior for every single stratum."""
         for st in StratumType:
             expected = 10_000 if st.name.startswith("SHIFT") else 60_000
             self.assertEqual(canonical_episode_count(st), expected)
-            inst = generate_instance(MASTER_SEED, st, 1)
+            inst = generate_instance(MASTER_SEED, st, 10)
 
-            if st == StratumType.NOMINAL_2_BOUNDARY_NOISE:
+            if st == StratumType.NOMINAL_1_STEADY:
+                self.assertEqual(inst.sensor_noise_scale, 1.0)
+            elif st == StratumType.NOMINAL_2_BOUNDARY_NOISE:
                 self.assertGreaterEqual(inst.sensor_noise_scale, 1.2)
+                self.assertLessEqual(inst.sensor_noise_scale, 1.5)
+            elif st == StratumType.NOMINAL_3_SHARED_BIAS:
+                self.assertGreaterEqual(inst.sensor_bias, -0.05)
+                self.assertLessEqual(inst.sensor_bias, 0.05)
             elif st == StratumType.NOMINAL_4_LOW_BRAKING:
+                self.assertGreaterEqual(inst.braking_deceleration, 0.20)
                 self.assertLessEqual(inst.braking_deceleration, 0.35)
             elif st == StratumType.NOMINAL_5_SENSOR_DELAY:
                 self.assertGreaterEqual(inst.actuator_delay, 0.08)
+                self.assertLessEqual(inst.actuator_delay, 0.10)
+            elif st == StratumType.NOMINAL_6_ADVERSE_COMPOUND:
+                self.assertLessEqual(inst.braking_deceleration, 0.35)
+                self.assertGreaterEqual(inst.actuator_delay, 0.07)
+                self.assertGreaterEqual(inst.sensor_noise_scale, 1.2)
             elif st == StratumType.SHIFT_1_DEGRADED_BRAKE:
+                self.assertGreaterEqual(inst.braking_deceleration, 0.15)
                 self.assertLess(inst.braking_deceleration, 0.20)
             elif st == StratumType.SHIFT_2_DOUBLE_NOISE:
                 self.assertEqual(inst.sensor_noise_scale, 2.0)
+            elif st == StratumType.SHIFT_3_COMMON_BIAS_EXTREME:
+                self.assertGreaterEqual(inst.sensor_bias, 0.05)
+                self.assertLessEqual(inst.sensor_bias, 0.10)
             elif st == StratumType.SHIFT_4_OBS_DROPOUT_500MS:
                 self.assertEqual(inst.dropout_duration_s, 0.50)
                 self.assertEqual(inst.dropout_start_s, 0.0)
+            elif st == StratumType.SHIFT_5_SURFACE_DISTRIBUTION:
+                # Bimodal friction bounds: either [0.12, 0.18] or [0.18, 0.22]
+                self.assertTrue((0.12 <= inst.braking_deceleration <= 0.18) or (0.18 <= inst.braking_deceleration <= 0.22))
+            elif st == StratumType.SHIFT_6_SIMULTANEOUS_FAULTS:
+                self.assertLess(inst.braking_deceleration, 0.20)
+                self.assertEqual(inst.sensor_noise_scale, 2.0)
+                self.assertGreaterEqual(inst.sensor_bias, 0.05)
+                self.assertEqual(inst.dropout_duration_s, 0.50)
 
     def test_lossless_hash_detects_single_bit_float_change(self):
         sample = generate_stratum_sample(MASTER_SEED, StratumType.NOMINAL_1_STEADY, 10)
@@ -109,8 +134,6 @@ class TestScenarioGenerator(unittest.TestCase):
         self.assertNotEqual(h_orig, h_mut)
 
     def test_sequence_custody_rejects_duplicate_or_unordered_episodes(self):
-        """Auditor check: supplying duplicate episodes or out-of-order sequences must fail validation."""
-        # Supply 10 copies of episode 0
         duplicate_stream = [generate_instance(MASTER_SEED, StratumType.NOMINAL_1_STEADY, 0) for _ in range(10)]
         with self.assertRaises(ValueError):
             compute_dataset_hash(duplicate_stream, MASTER_SEED, validate_canonical_sequence=True)

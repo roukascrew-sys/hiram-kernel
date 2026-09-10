@@ -1,5 +1,5 @@
 """
-Dual-sensor observation pipeline with unbiased cumulative encoder physics,
+Dual-sensor observation pipeline with hysteresis-stabilized incremental encoder physics,
 tri-state range literals, and literal observation dropouts.
 """
 
@@ -41,11 +41,12 @@ class SensorPipeline:
         self.scenario = scenario
         self.last_valid_timestamp: float = 0.0
 
-        # Stateful encoder tracking:
-        # True physical displacement is accumulated uncorrupted.
-        # Optical detector phase jitter is applied directly at readout without clamping rectification.
-        self.cumulative_true_pos_m: float = 0.0
+        # Physical displacement tracking from exact plant coordinates
+        self.last_physical_x: Optional[float] = None
         self.last_encoder_time: Optional[float] = None
+
+        # Cumulative monotonic tick count (prevents boundary chattering/rectification)
+        self.max_observed_ticks: int = 0
         self.cumulative_ticks: int = 0
 
         tof_seed = derive_domain_seed(master_seed, scenario.stratum.name, scenario.episode_id, "tof")
@@ -95,25 +96,33 @@ class SensorPipeline:
             d_marginal = D_CRITICAL_THRESHOLD_M <= d_min < D_MARGINAL_THRESHOLD_M
             sensor_disagree = abs(d_tof - d_ultra) > SENSOR_DISAGREE_THRESHOLD_M
 
-        # Stateful incremental encoder physics (unbiased noise model)
+        # Encoder timing
         if self.last_encoder_time is None:
-            dt_enc = 0.0
-            self.last_encoder_time = t
+            dt_enc = dt_sample
         else:
-            dt_enc = max(0.0, t - self.last_encoder_time)
-            self.last_encoder_time = t
+            dt_enc = max(1e-6, t - self.last_encoder_time)
+        self.last_encoder_time = t
 
-        # Accumulate exact continuous physical wheel motion (no rectification bias)
-        if current_v > 0.0 and dt_enc > 0.0:
-            self.cumulative_true_pos_m += current_v * dt_enc
+        # Exact displacement tracking from plant state
+        if self.last_physical_x is None:
+            self.last_physical_x = current_x
 
-        # Sensor phase jitter applies to optical edge detection without mutating accumulated distance
+        # Incremental optical encoder model:
+        # Optical phase jitter applies to the boundary threshold detection.
+        # Monotonic high-water mark prevents chatter rectification on stationary/slow boundaries.
         optical_jitter = self.rng_enc.gauss(0.0, 0.00002) if current_v > 0.0 else 0.0
-        effective_readout_pos = max(0.0, self.cumulative_true_pos_m + optical_jitter)
+        effective_x = max(0.0, current_x + optical_jitter)
+        raw_tick_index = math.floor(effective_x / TICK_PITCH)
 
-        current_ticks = math.floor(effective_readout_pos / TICK_PITCH)
-        delta_ticks = max(0, current_ticks - self.cumulative_ticks)
-        self.cumulative_ticks = current_ticks
+        # Monotonic tick accumulation for forward 1D travel
+        if raw_tick_index > self.max_observed_ticks:
+            delta_ticks = raw_tick_index - self.max_observed_ticks
+            self.max_observed_ticks = raw_tick_index
+            self.cumulative_ticks = self.max_observed_ticks
+        else:
+            delta_ticks = 0
+
+        self.last_physical_x = current_x
 
         eff_dt = dt_enc if dt_enc > 0.0 else dt_sample
         v_measured = max(0.0, (delta_ticks * TICK_PITCH) / eff_dt)

@@ -88,9 +88,14 @@ def generate_instance(master_seed: str, stratum: StratumType, episode_id: int) -
 
     x_stop = analytic_plant.stopping_position(state, params, command_time=0.0)
 
+    # Reserve margin allocation
     is_shift = stratum.name.startswith("SHIFT")
     if is_shift:
-        reserve_draw = rng.uniform(-0.05, 1.0)
+        # Dropout strata guarantee minimum obstacle clearance to prevent early truncation
+        if stratum in (StratumType.SHIFT_4_OBS_DROPOUT_500MS, StratumType.SHIFT_6_SIMULTANEOUS_FAULTS):
+            reserve_draw = rng.uniform(0.10, 1.0)
+        else:
+            reserve_draw = rng.uniform(-0.05, 1.0)
     else:
         u = rng.random()
         if u < 0.30:
@@ -142,11 +147,7 @@ def compute_dataset_hash(
 ) -> str:
     """
     Cryptographically digests canonical rows in strict order.
-    When validate_canonical_sequence=True, strictly validates:
-    - Exactly 12 strata in StratumType enum order
-    - Exactly canonical_episode_count(st) episodes per stratum
-    - Consecutive episode_id indexing (0 .. N-1)
-    - Rejects duplicate, missing, or out-of-order episodes.
+    Enforces exact 12 strata, declared counts, and consecutive indexing.
     """
     hasher = hashlib.sha256()
     header = (

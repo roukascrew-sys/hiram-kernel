@@ -14,7 +14,6 @@ from sim.sensors.pipeline import SensorObservation, SensorPipeline
 @dataclass(frozen=True)
 class EvidenceVector:
     timestamp: float
-    # Range literals are Optional[bool]: True, False, or None (Masked / Unobserved)
     d_critical: Optional[bool]
     d_marginal: Optional[bool]
     v_high: bool
@@ -63,15 +62,31 @@ class EpisodeRunResult:
 def compute_kinematic_state(
     x0: float, v0: float, a_cmd: float, tau: float, b: float, t: float
 ) -> PlantState:
-    """Exact closed-form 1D cart kinematics under actuator delay and emergency braking."""
+    """
+    Exact closed-form 1D cart kinematics under actuator delay and emergency braking.
+    Guarantees monotonic position clamping once velocity reaches zero.
+    """
+    # Phase 1: During actuator delay (t <= tau)
     if t <= tau:
-        x = x0 + v0 * t + 0.5 * a_cmd * (t ** 2)
-        v = max(0.0, v0 + a_cmd * t)
-        a = a_cmd
+        # Check if negative commanded acceleration brings velocity to 0 before delay expires
+        if a_cmd < 0.0 and (v0 / abs(a_cmd)) < t:
+            t_stop = v0 / abs(a_cmd)
+            x = x0 + v0 * t_stop + 0.5 * a_cmd * (t_stop ** 2)
+            v = 0.0
+            a = 0.0
+        else:
+            x = x0 + v0 * t + 0.5 * a_cmd * (t ** 2)
+            v = max(0.0, v0 + a_cmd * t)
+            a = a_cmd
     else:
-        # State at end of delay interval
-        x_tau = x0 + v0 * tau + 0.5 * a_cmd * (tau ** 2)
-        v_tau = max(0.0, v0 + a_cmd * tau)
+        # State at delay expiration
+        if a_cmd < 0.0 and (v0 / abs(a_cmd)) < tau:
+            t_stop = v0 / abs(a_cmd)
+            x_tau = x0 + v0 * t_stop + 0.5 * a_cmd * (t_stop ** 2)
+            v_tau = 0.0
+        else:
+            x_tau = x0 + v0 * tau + 0.5 * a_cmd * (tau ** 2)
+            v_tau = max(0.0, v0 + a_cmd * tau)
 
         t_brake = t - tau
         if v_tau <= 0.0:
@@ -96,12 +111,11 @@ def run_episode(
     scenario: ScenarioInstance,
     master_seed: str,
     dt: float = 0.01,
-    max_duration_s: float = 2.0,
+    max_duration_s: float = 3.0,
 ) -> EpisodeRunResult:
     """
-    Executes a scenario episode at 100 Hz (dt=0.01s).
-    Guarantees that dropout episodes (SHIFT_4 and SHIFT_6) continue sampling
-    through the complete 500 ms dropout window, even if the cart comes to a stop.
+    Executes a scenario episode at 100 Hz.
+    Guarantees full 500 ms dropout sampling without premature truncation.
     """
     pipeline = SensorPipeline(master_seed, scenario)
     consumer = BayesianEvidenceConsumer()
@@ -111,7 +125,7 @@ def run_episode(
     terminated = False
     term_reason = "max_duration_reached"
 
-    # Ensure evaluation captures full 500 ms dropout even if cart stops early
+    # Horizon guarantees dropout completion even if cart stops early
     min_horizon = (
         (scenario.dropout_start_s + scenario.dropout_duration_s + 0.05)
         if scenario.dropout_duration_s > 0.0
