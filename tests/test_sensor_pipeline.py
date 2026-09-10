@@ -95,6 +95,42 @@ class TestSensorPipeline(unittest.TestCase):
         self.assertIsNotNone(obs_rec.d_tof)
         self.assertIsNotNone(obs_rec.d_critical)
         self.assertFalse(obs_rec.telemetry_stale)
+    def test_shift4_full_500ms_dropout_episode_execution(self):
+        """
+        Auditor check: SHIFT_4 must execute the complete 500 ms dropout timeline,
+        preserve None as unknown evidence, and recover valid telemetry at t >= 0.50s.
+        """
+        from sim.runner import run_episode
+
+        sc = generate_instance(MASTER_SEED, StratumType.SHIFT_4_OBS_DROPOUT_500MS, 0)
+        result = run_episode(sc, MASTER_SEED, dt=0.01)
+
+        # At 100 Hz, a 500 ms dropout must execute exactly 50 masked frames
+        self.assertEqual(result.dropout_steps_executed, 50, f"Expected 50 dropout frames, got {result.dropout_steps_executed}")
+        self.assertGreaterEqual(result.total_duration_s, 0.50)
+
+        # Inspect frames during dropout: range literals must be strictly None
+        for frame in result.evidence_frames[:50]:
+            self.assertIsNone(frame.d_critical)
+            self.assertIsNone(frame.d_marginal)
+            self.assertIsNone(frame.sensor_disagree)
+            self.assertTrue(frame.telemetry_stale)
+
+        # Inspect frames immediately after dropout: evidence must recover
+        post_dropout_frame = result.evidence_frames[50]
+        self.assertIsNotNone(post_dropout_frame.d_critical)
+        self.assertFalse(post_dropout_frame.telemetry_stale)
+
+    def test_shift6_simultaneous_fault_episode_handling(self):
+        """Auditor check: SHIFT_6 must execute combined degraded brakes and 500 ms dropout."""
+        from sim.runner import run_episode
+
+        sc = generate_instance(MASTER_SEED, StratumType.SHIFT_6_SIMULTANEOUS_FAULTS, 0)
+        result = run_episode(sc, MASTER_SEED, dt=0.01)
+
+        self.assertEqual(result.dropout_steps_executed, 50)
+        self.assertLess(sc.braking_deceleration, 0.20)
+        self.assertEqual(sc.sensor_noise_scale, 2.0)
 
 
 if __name__ == "__main__":
