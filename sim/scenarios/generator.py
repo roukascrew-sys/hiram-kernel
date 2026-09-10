@@ -1,423 +1,211 @@
 """
-sim.scenarios.generator - Deterministic, sealed scenario generation.
-
-Generates the 420,000 episodes (6 nominal strata x 60,000 + 6 shift strata x
-10,000; see strata.py) that make up the stopping benchmark's evaluation set.
-
-Seed custody
-------------
-Every episode's PRNG seed is derived from (master_seed, stratum, episode_id)
-via SHA-256 (derive_seed), never from a single incrementing stream shared
-across strata or episodes. That gives two properties a shared stream cannot:
-
-  * any single episode can be regenerated in isolation (generate_episode),
-    without replaying every episode before it in its stratum;
-  * inserting, removing, or reordering strata cannot perturb any other
-    stratum's seeds or parameters, since each stratum is salted independently
-    by its own name, not by its position in some master sequence.
-
-manifest_digest() then seals a *generated batch*: a single SHA-256 over every
-instance's fully-specified fields, so a downstream consumer can confirm they
-have the exact canonical dataset for a given master_seed, not a tampered or
-partial one.
-
-Recoverability guarantee
--------------------------
-sim.plant.analytic_plant (imported read-only; this module never modifies
-sim/plant) is used to verify, for every nominal-stratum episode, that
-commanding full emergency braking at t=0 would stop the cart at least
-CLEARANCE_MARGIN_M short of obstacle_position. The nominal sampling envelope
-below is sized so this holds by construction (worst case nominal kinematics
-stop within ~0.68 m; the obstacle floor is 1.0 m) -- the resample/fallback
-logic in _generate_one exists as defense in depth, not as the primary
-mechanism, and test_scenario_generator.py checks it is never actually
-needed. Shift-stratum episodes are not filtered this way: an unrecoverable
-shift episode is valid ground truth for evaluating whether a downstream
-safety monitor correctly flags it.
+Boundary-dense scenario generator with guaranteed nominal recoverability,
+full 12-strata physical logic, strict sequence custody validation, and verified dataset sealing.
 """
 
 import hashlib
+import json
+import math
 import random
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Generator, Iterable, List, Optional
 
 from sim.plant import PlantParameters, PlantState
-from sim.plant.analytic_plant import stopping_position
+from sim.plant import analytic_plant
+from .strata import ScenarioInstance, StratumType, derive_domain_seed
 
-from .strata import NOMINAL_STRATA, ScenarioInstance, StratumType, episodes_for
-
-DEFAULT_MASTER_SEED = 20260910  # fixed, documented constant; pass a different one to mint a distinct sealed dataset
-
-CLEARANCE_MARGIN_M = 0.10  # matches this benchmark's collision-clearance convention (sim/plant tests)
-MAX_RECOVERABILITY_RESAMPLES = 64
-
-
-def derive_seed(master_seed: int, stratum: StratumType, episode_id: int) -> int:
-    """
-    Cryptographically salted, per-episode PRNG seed, per the exact formula
-    mandated for this generator:
-
-        seed = int(sha256(f"{master_seed}:{stratum.name}:{episode_id}").hexdigest()[:8], 16)
-
-    Note this truncates to the leading 8 *hex characters* (32 bits, not 64):
-    with ~420,000 total episodes, the birthday bound puts the expected number
-    of accidental seed collisions across the full population at roughly
-    420000^2 / (2 * 2**32) =~ 20. A collision means two distinct
-    (stratum, episode_id) pairs end up drawing from identical RNG streams --
-    tests/test_scenario_generator.py measures the actual collision count
-    against this estimate rather than assuming either "no collisions" or
-    silently widening the seed, since the formula is specified exactly above.
-    """
-    key = f"{master_seed}:{stratum.name}:{episode_id}"
-    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16)
+DEFAULT_MASTER_SEED = "HIRAM-BENCHMARK-2026-SEALED-V1"
+SCHEMA_VERSION = "1.0.0-PROD"
+GENERATOR_REVISION = "rev-m0-final"
+NOMINAL_EPISODES_PER_STRATUM = 60_000
+SHIFT_EPISODES_PER_STRATUM = 10_000
+TOTAL_BENCHMARK_EPISODES = 6 * NOMINAL_EPISODES_PER_STRATUM + 6 * SHIFT_EPISODES_PER_STRATUM  # 420,000
 
 
-def _is_recoverable(
-    x0: float,
-    v0: float,
-    obstacle_position: float,
-    braking_deceleration: float,
-    actuator_delay: float,
-    clearance_margin: float = CLEARANCE_MARGIN_M,
-) -> bool:
-    """True if emergency braking commanded immediately (t=0) stops the cart
-    at least `clearance_margin` meters short of obstacle_position, per the
-    independent analytic plant oracle (sim.plant.analytic_plant)."""
+def canonical_episode_count(stratum: StratumType) -> int:
+    return SHIFT_EPISODES_PER_STRATUM if stratum.name.startswith("SHIFT") else NOMINAL_EPISODES_PER_STRATUM
+
+
+def derive_seed(master_seed: str, stratum_name: str, episode_id: int, domain: str = "dynamics") -> int:
+    return derive_domain_seed(master_seed, stratum_name, episode_id, domain)
+
+
+def generate_instance(master_seed: str, stratum: StratumType, episode_id: int) -> ScenarioInstance:
+    """Generates a single reproducible scenario instance implementing explicit strata physics."""
+    dynamics_seed = derive_domain_seed(master_seed, stratum.name, episode_id, "dynamics")
+    rng = random.Random(dynamics_seed)
+
+    x0 = 0.0
+    v0 = rng.uniform(0.0, 0.50)
+    a_cmd = rng.uniform(-0.25, 0.25)
+    tau = rng.uniform(0.0, 0.10)
+    b = rng.uniform(0.20, 1.0)
+    bias = rng.uniform(-0.03, 0.03)
+    noise_scale = 1.0
+    dropout_start = 0.0
+    dropout_duration = 0.0
+
+    # Explicit 12-Stratum Parameterization
+    if stratum == StratumType.NOMINAL_1_STEADY:
+        pass
+    elif stratum == StratumType.NOMINAL_2_BOUNDARY_NOISE:
+        noise_scale = rng.uniform(1.2, 1.5)
+    elif stratum == StratumType.NOMINAL_3_SHARED_BIAS:
+        bias = rng.uniform(-0.05, 0.05)
+    elif stratum == StratumType.NOMINAL_4_LOW_BRAKING:
+        b = rng.uniform(0.20, 0.35)
+    elif stratum == StratumType.NOMINAL_5_SENSOR_DELAY:
+        tau = rng.uniform(0.08, 0.10)
+    elif stratum == StratumType.NOMINAL_6_ADVERSE_COMPOUND:
+        b = rng.uniform(0.20, 0.35)
+        tau = rng.uniform(0.07, 0.10)
+        bias = rng.uniform(-0.04, 0.04)
+        noise_scale = rng.uniform(1.2, 1.4)
+    elif stratum == StratumType.SHIFT_1_DEGRADED_BRAKE:
+        b = rng.uniform(0.15, 0.199)
+    elif stratum == StratumType.SHIFT_2_DOUBLE_NOISE:
+        noise_scale = 2.0
+    elif stratum == StratumType.SHIFT_3_COMMON_BIAS_EXTREME:
+        bias = rng.uniform(0.05, 0.10)
+    elif stratum == StratumType.SHIFT_4_OBS_DROPOUT_500MS:
+        dropout_start = 0.0
+        dropout_duration = 0.50
+    elif stratum == StratumType.SHIFT_5_SURFACE_DISTRIBUTION:
+        b = rng.uniform(0.12, 0.18) if rng.random() < 0.5 else rng.uniform(0.18, 0.22)
+    elif stratum == StratumType.SHIFT_6_SIMULTANEOUS_FAULTS:
+        b = rng.uniform(0.15, 0.199)
+        noise_scale = 2.0
+        bias = rng.uniform(0.05, 0.10)
+        dropout_start = 0.0
+        dropout_duration = 0.50
+
     state = PlantState(position=x0, velocity=v0, acceleration=0.0)
     params = PlantParameters(
-        actuator_delay=actuator_delay,
-        braking_deceleration=braking_deceleration,
-        obstacle_position=obstacle_position,
-    )
-    stop_pos = stopping_position(state, params, command_time=0.0)
-    return stop_pos <= obstacle_position - clearance_margin
-
-
-# ---------------------------------------------------------------------------
-# Per-stratum sampling envelopes.
-#
-# All twelve strata share the ScenarioInstance schema; what distinguishes
-# them is which distribution each field is drawn from. Nominal strata (1-6)
-# stay within sim/plant's declared physical bounds (actuator_delay in
-# [0, 0.10] s, braking_deceleration in [0.2, 1.0] m/s^2) and are sized so
-# that even worst-case nominal kinematics (v0=0.5, tau=0.10, b=0.2) stop
-# within ~0.68 m -- comfortably inside the 1.0 m obstacle floor with margin
-# to spare, so the recoverability guarantee holds by construction. Shift
-# strata (1-6) deliberately sample outside that envelope, or from a
-# differently-shaped distribution, to probe generalization/degradation.
-#
-# The exact numeric ranges below are this generator's own interpretation of
-# each stratum's name (the originating spec did not enumerate them); they
-# are documented per-stratum so they can be retuned without touching the
-# custody/recoverability machinery around them.
-# ---------------------------------------------------------------------------
-V0_NOMINAL = (0.05, 0.5)  # m/s
-TAU_NOMINAL = (0.0, 0.10)  # s
-OBSTACLE_NOMINAL = (1.0, 4.0)  # m
-
-_StratumSampler = Callable[[random.Random], Dict[str, float]]
-
-
-def _sample_nominal_1_steady(rng: random.Random) -> Dict[str, float]:
-    """Baseline nominal envelope: no elevated noise, bias, or delay."""
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=rng.uniform(0.4, 1.0),
-        actuator_delay=rng.uniform(0.0, 0.05),
-        sensor_bias=rng.uniform(-0.01, 0.01),
-        sensor_noise_scale=rng.uniform(0.95, 1.05),
+        actuator_delay=tau,
+        braking_deceleration=b,
+        commanded_acceleration=a_cmd,
+        obstacle_position=100.0,
     )
 
+    x_stop = analytic_plant.stopping_position(state, params, command_time=0.0)
 
-def _sample_nominal_2_boundary_noise(rng: random.Random) -> Dict[str, float]:
-    """Sensor noise pushed toward the top of the still-nominal band."""
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=rng.uniform(0.4, 1.0),
-        actuator_delay=rng.uniform(0.0, 0.05),
-        sensor_bias=rng.uniform(-0.02, 0.02),
-        sensor_noise_scale=rng.uniform(1.0, 1.5),
-    )
-
-
-def _sample_nominal_3_shared_bias(rng: random.Random) -> Dict[str, float]:
-    """A systematic (shared, not per-sample) range bias, still nominal-scale."""
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=rng.uniform(0.4, 1.0),
-        actuator_delay=rng.uniform(0.0, 0.05),
-        sensor_bias=rng.uniform(-0.08, 0.08),
-        sensor_noise_scale=rng.uniform(0.95, 1.05),
-    )
-
-
-def _sample_nominal_4_low_braking(rng: random.Random) -> Dict[str, float]:
-    """Braking capability at the low sub-band of the nominal [0.2, 1.0] range."""
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=rng.uniform(0.2, 0.4),
-        actuator_delay=rng.uniform(0.0, 0.05),
-        sensor_bias=rng.uniform(-0.01, 0.01),
-        sensor_noise_scale=rng.uniform(0.95, 1.05),
-    )
-
-
-def _sample_nominal_5_sensor_delay(rng: random.Random) -> Dict[str, float]:
-    """Actuator delay at the high sub-band of the nominal [0, 0.10] s range."""
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=rng.uniform(0.4, 1.0),
-        actuator_delay=rng.uniform(0.06, 0.10),
-        sensor_bias=rng.uniform(-0.01, 0.01),
-        sensor_noise_scale=rng.uniform(0.95, 1.05),
-    )
-
-
-def _sample_nominal_6_adverse_compound(rng: random.Random) -> Dict[str, float]:
-    """Several nominal-scale stressors stacked at once (still in-envelope)."""
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=rng.uniform(0.2, 0.5),
-        actuator_delay=rng.uniform(0.05, 0.10),
-        sensor_bias=rng.uniform(-0.05, 0.05),
-        sensor_noise_scale=rng.uniform(1.0, 1.3),
-    )
-
-
-def _sample_shift_1_degraded_brake(rng: random.Random) -> Dict[str, float]:
-    """Braking capability below the nominal floor -- a genuinely degraded brake."""
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=rng.uniform(0.05, 0.2),
-        actuator_delay=rng.uniform(*TAU_NOMINAL),
-        sensor_bias=rng.uniform(-0.02, 0.02),
-        sensor_noise_scale=rng.uniform(0.95, 1.05),
-    )
-
-
-def _sample_shift_2_double_noise(rng: random.Random) -> Dict[str, float]:
-    """Sensor noise roughly double the nominal ~1.0 baseline."""
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=rng.uniform(0.4, 1.0),
-        actuator_delay=rng.uniform(*TAU_NOMINAL),
-        sensor_bias=rng.uniform(-0.02, 0.02),
-        sensor_noise_scale=rng.uniform(1.8, 2.2),
-    )
-
-
-def _sample_shift_3_common_bias_extreme(rng: random.Random) -> Dict[str, float]:
-    """A shared range bias at extreme magnitude, sign randomized."""
-    sign = rng.choice((-1.0, 1.0))
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=rng.uniform(0.4, 1.0),
-        actuator_delay=rng.uniform(*TAU_NOMINAL),
-        sensor_bias=sign * rng.uniform(0.15, 0.5),
-        sensor_noise_scale=rng.uniform(0.95, 1.05),
-    )
-
-
-def _sample_shift_4_obs_dropout_500ms(rng: random.Random) -> Dict[str, float]:
-    """Isolated stressor: physical kinematics stay nominal-ish. ScenarioInstance
-    has no per-timestep dropout-duration field (the schema is fixed to
-    exactly the given contract), so a 500 ms window of missing observations
-    is represented the only way a single per-episode scalar can: as an
-    extreme sensor_noise_scale (5.0-10.0, an order of magnitude past even
-    SHIFT_2_DOUBLE_NOISE's 1.8-2.2 band) -- during the dropout, readings a
-    downstream consumer does get are effectively unusable, which is the
-    practical consequence this stratum needs to be distinguishable by."""
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=rng.uniform(0.4, 1.0),
-        actuator_delay=rng.uniform(*TAU_NOMINAL),
-        sensor_bias=rng.uniform(-0.02, 0.02),
-        sensor_noise_scale=rng.uniform(5.0, 10.0),
-    )
-
-
-def _sample_shift_5_surface_distribution(rng: random.Random) -> Dict[str, float]:
-    """A genuine change in distribution *shape*, not just its bounds: a
-    minority of episodes draw braking_deceleration from a degraded
-    ("icy patch") sub-band instead of the nominal one."""
-    if rng.random() < 0.3:
-        braking_deceleration = rng.uniform(0.05, 0.2)
+    is_shift = stratum.name.startswith("SHIFT")
+    if is_shift:
+        reserve_draw = rng.uniform(-0.05, 1.0)
     else:
-        braking_deceleration = rng.uniform(0.4, 1.0)
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=braking_deceleration,
-        actuator_delay=rng.uniform(*TAU_NOMINAL),
-        sensor_bias=rng.uniform(-0.02, 0.02),
-        sensor_noise_scale=rng.uniform(0.95, 1.05),
-    )
-
-
-def _sample_shift_6_simultaneous_faults(rng: random.Random) -> Dict[str, float]:
-    """Every shift-level stressor stacked at once: degraded brake (SHIFT_1),
-    high delay, extreme bias (SHIFT_3), and the SHIFT_4-style extreme
-    sensor_noise_scale standing in for the 500 ms dropout -- all at once."""
-    sign = rng.choice((-1.0, 1.0))
-    return dict(
-        v0=rng.uniform(*V0_NOMINAL),
-        obstacle_position=rng.uniform(*OBSTACLE_NOMINAL),
-        braking_deceleration=rng.uniform(0.05, 0.2),
-        actuator_delay=rng.uniform(0.06, 0.10),
-        sensor_bias=sign * rng.uniform(0.15, 0.5),
-        sensor_noise_scale=rng.uniform(5.0, 10.0),
-    )
-
-
-_SAMPLERS: Dict[StratumType, _StratumSampler] = {
-    StratumType.NOMINAL_1_STEADY: _sample_nominal_1_steady,
-    StratumType.NOMINAL_2_BOUNDARY_NOISE: _sample_nominal_2_boundary_noise,
-    StratumType.NOMINAL_3_SHARED_BIAS: _sample_nominal_3_shared_bias,
-    StratumType.NOMINAL_4_LOW_BRAKING: _sample_nominal_4_low_braking,
-    StratumType.NOMINAL_5_SENSOR_DELAY: _sample_nominal_5_sensor_delay,
-    StratumType.NOMINAL_6_ADVERSE_COMPOUND: _sample_nominal_6_adverse_compound,
-    StratumType.SHIFT_1_DEGRADED_BRAKE: _sample_shift_1_degraded_brake,
-    StratumType.SHIFT_2_DOUBLE_NOISE: _sample_shift_2_double_noise,
-    StratumType.SHIFT_3_COMMON_BIAS_EXTREME: _sample_shift_3_common_bias_extreme,
-    StratumType.SHIFT_4_OBS_DROPOUT_500MS: _sample_shift_4_obs_dropout_500ms,
-    StratumType.SHIFT_5_SURFACE_DISTRIBUTION: _sample_shift_5_surface_distribution,
-    StratumType.SHIFT_6_SIMULTANEOUS_FAULTS: _sample_shift_6_simultaneous_faults,
-}
-
-
-def _generate_one(stratum: StratumType, episode_id: int, master_seed: int) -> ScenarioInstance:
-    seed = derive_seed(master_seed, stratum, episode_id)
-    rng = random.Random(seed)
-    sampler = _SAMPLERS[stratum]
-
-    params = sampler(rng)
-    recoverable = _is_recoverable(
-        x0=0.0,
-        v0=params["v0"],
-        obstacle_position=params["obstacle_position"],
-        braking_deceleration=params["braking_deceleration"],
-        actuator_delay=params["actuator_delay"],
-    )
-
-    if stratum in NOMINAL_STRATA and not recoverable:
-        # Defense in depth: by construction (see module docstring) this
-        # should never fire for a nominal stratum. If it ever does, keep
-        # resampling this episode's kinematics from the SAME seeded stream
-        # -- the episode stays 100% reproducible from `seed` alone.
-        for _attempt in range(MAX_RECOVERABILITY_RESAMPLES):
-            params = sampler(rng)
-            recoverable = _is_recoverable(
-                x0=0.0,
-                v0=params["v0"],
-                obstacle_position=params["obstacle_position"],
-                braking_deceleration=params["braking_deceleration"],
-                actuator_delay=params["actuator_delay"],
-            )
-            if recoverable:
-                break
+        u = rng.random()
+        if u < 0.30:
+            reserve_draw = rng.uniform(0.001, 0.05)  # 30% Critical boundary stress
+        elif u < 0.70:
+            reserve_draw = rng.uniform(0.05, 0.30)   # 40% Marginal band
         else:
-            # Exhausted every resample attempt: guarantee the invariant
-            # anyway by deterministically pushing the obstacle out to a
-            # provably-safe distance for this episode's own kinematics,
-            # rather than ever emitting an unrecoverable "nominal" episode.
-            worst_case_stop = params["v0"] * params["actuator_delay"] + (params["v0"] ** 2) / (
-                2.0 * params["braking_deceleration"]
-            )
-            params["obstacle_position"] = worst_case_stop + CLEARANCE_MARGIN_M + 0.5
-            recoverable = True
+            reserve_draw = rng.uniform(0.30, 1.50)   # 30% Open clearance
+
+    obstacle_position = x_stop + 0.10 + reserve_draw
+    clearance_margin = obstacle_position - x_stop
+    is_recoverable = clearance_margin >= 0.10
 
     return ScenarioInstance(
         episode_id=episode_id,
         stratum=stratum,
-        seed=seed,
-        x0=0.0,
-        v0=params["v0"],
-        obstacle_position=params["obstacle_position"],
-        braking_deceleration=params["braking_deceleration"],
-        actuator_delay=params["actuator_delay"],
-        sensor_bias=params["sensor_bias"],
-        sensor_noise_scale=params["sensor_noise_scale"],
-        is_recoverable=recoverable,
+        seed=dynamics_seed,
+        x0=x0,
+        v0=v0,
+        commanded_acceleration=a_cmd,
+        obstacle_position=obstacle_position,
+        braking_deceleration=b,
+        actuator_delay=tau,
+        sensor_bias=bias,
+        sensor_noise_scale=noise_scale,
+        dropout_start_s=dropout_start,
+        dropout_duration_s=dropout_duration,
+        is_recoverable=is_recoverable,
     )
 
 
-def iter_stratum(stratum: StratumType, master_seed: int = DEFAULT_MASTER_SEED) -> Iterator[ScenarioInstance]:
-    """Lazily yield every episode of one stratum, in episode_id order."""
-    for episode_id in range(episodes_for(stratum)):
-        yield _generate_one(stratum, episode_id, master_seed)
+generate_episode = generate_instance
 
 
-def generate_stratum_sample(
-    stratum: StratumType, count: int, master_seed: int = DEFAULT_MASTER_SEED
-) -> Iterator[ScenarioInstance]:
+def generate_canonical_stratum(master_seed: str, stratum: StratumType) -> Generator[ScenarioInstance, None, None]:
+    count = canonical_episode_count(stratum)
+    for ep_id in range(count):
+        yield generate_instance(master_seed, stratum, ep_id)
+
+
+def generate_stratum_sample(master_seed: str, stratum: StratumType, count: int) -> List[ScenarioInstance]:
+    return [generate_instance(master_seed, stratum, ep_id) for ep_id in range(count)]
+
+
+def compute_dataset_hash(
+    dataset_stream: Iterable[ScenarioInstance],
+    master_seed: str,
+    validate_canonical_sequence: bool = True,
+) -> str:
     """
-    Lazily yield the first `count` episodes (episode_id 0..count-1, clamped
-    to the stratum's actual size) of one stratum. This is the primary
-    streaming/chunked entry point for pulling a bounded sample without
-    materializing (or writing to disk) the full 60,000/10,000-episode
-    population -- a plain generator, so a caller that only consumes part of
-    it, or that wants to write results out in chunks, never holds more than
-    one ScenarioInstance in memory at a time because of this function.
-    """
-    if count < 0:
-        raise ValueError(f"count must be >= 0, got {count!r}")
-    n = min(count, episodes_for(stratum))
-    for episode_id in range(n):
-        yield _generate_one(stratum, episode_id, master_seed)
-
-
-def generate_stratum(stratum: StratumType, master_seed: int = DEFAULT_MASTER_SEED) -> List[ScenarioInstance]:
-    """Materialize every episode of one stratum as a list."""
-    return list(iter_stratum(stratum, master_seed))
-
-
-def generate_episode(
-    stratum: StratumType, episode_id: int, master_seed: int = DEFAULT_MASTER_SEED
-) -> ScenarioInstance:
-    """Regenerate exactly one episode in isolation -- the seed-custody
-    guarantee in action: no need to replay the stratum from episode 0."""
-    n = episodes_for(stratum)
-    if not 0 <= episode_id < n:
-        raise ValueError(f"{stratum.name} has {n} episodes; episode_id={episode_id} out of range")
-    return _generate_one(stratum, episode_id, master_seed)
-
-
-def iter_all(
-    master_seed: int = DEFAULT_MASTER_SEED,
-    strata: Optional[Tuple[StratumType, ...]] = None,
-) -> Iterator[ScenarioInstance]:
-    """Lazily yield every episode across the given strata (default: all
-    twelve), in the given stratum order, episode_id order within each."""
-    from .strata import ALL_STRATA
-
-    for stratum in strata if strata is not None else ALL_STRATA:
-        yield from iter_stratum(stratum, master_seed)
-
-
-def manifest_digest(instances: Iterable[ScenarioInstance]) -> str:
-    """
-    SHA-256 hex digest over the ordered, fully-specified fields of every
-    instance -- the 'seal' for a generated batch. Two calls over the same
-    (ordered) instances always produce the same digest; changing any field of
-    any instance, or their order, changes it.
+    Cryptographically digests canonical rows in strict order.
+    When validate_canonical_sequence=True, strictly validates:
+    - Exactly 12 strata in StratumType enum order
+    - Exactly canonical_episode_count(st) episodes per stratum
+    - Consecutive episode_id indexing (0 .. N-1)
+    - Rejects duplicate, missing, or out-of-order episodes.
     """
     hasher = hashlib.sha256()
-    for inst in instances:
-        record = (
-            f"{inst.episode_id}|{inst.stratum.name}|{inst.seed}|"
-            f"{inst.x0!r}|{inst.v0!r}|{inst.obstacle_position!r}|"
-            f"{inst.braking_deceleration!r}|{inst.actuator_delay!r}|"
-            f"{inst.sensor_bias!r}|{inst.sensor_noise_scale!r}|"
-            f"{inst.is_recoverable}\n"
+    header = (
+        f"HIRAM-CUSTODY|V:{SCHEMA_VERSION}|REV:{GENERATOR_REVISION}|"
+        f"SEED:{master_seed}|COUNT:{TOTAL_BENCHMARK_EPISODES}".encode("utf-8")
+    )
+    hasher.update(header)
+
+    strata_list = list(StratumType)
+    current_stratum_idx = 0
+    current_expected_id = 0
+    total_count = 0
+
+    for instance in dataset_stream:
+        if validate_canonical_sequence:
+            expected_stratum = strata_list[current_stratum_idx]
+            if instance.stratum != expected_stratum:
+                raise ValueError(
+                    f"Sequence error at row {total_count}: expected {expected_stratum.name}, got {instance.stratum.name}"
+                )
+            if instance.episode_id != current_expected_id:
+                raise ValueError(
+                    f"Sequence error in {expected_stratum.name}: expected id {current_expected_id}, got {instance.episode_id}"
+                )
+
+            current_expected_id += 1
+            if current_expected_id == canonical_episode_count(expected_stratum):
+                current_stratum_idx += 1
+                current_expected_id = 0
+
+        hasher.update(instance.canonical_repr().encode("utf-8"))
+        total_count += 1
+
+    if validate_canonical_sequence and total_count != TOTAL_BENCHMARK_EPISODES:
+        raise ValueError(
+            f"Dataset incomplete: expected {TOTAL_BENCHMARK_EPISODES} episodes, processed {total_count}."
         )
-        hasher.update(record.encode("utf-8"))
+
     return hasher.hexdigest()
+
+
+def manifest_digest(master_seed: str = DEFAULT_MASTER_SEED) -> str:
+    """Computes the full verified custody hash over all 420,000 canonical episodes."""
+    def stream_all():
+        for st in StratumType:
+            for inst in generate_canonical_stratum(master_seed, st):
+                yield inst
+    return compute_dataset_hash(stream_all(), master_seed, validate_canonical_sequence=True)
+
+
+def build_manifest_metadata(master_seed: str = DEFAULT_MASTER_SEED) -> Dict:
+    """Builds the complete custody manifest dictionary for archival verification."""
+    digest = manifest_digest(master_seed)
+    counts = {st.name: canonical_episode_count(st) for st in StratumType}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generator_revision": GENERATOR_REVISION,
+        "master_seed": master_seed,
+        "total_episodes": TOTAL_BENCHMARK_EPISODES,
+        "stratum_counts": counts,
+        "sha256_canonical_digest": digest,
+    }

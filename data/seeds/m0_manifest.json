@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0.0-PROD",
+  "generator_revision": "rev-m0-final",
+  "master_seed": "HIRAM-BENCHMARK-2026-SEALED-V1",
+  "total_episodes": 420000,
+  "stratum_counts": {
+    "NOMINAL_1_STEADY": 60000,
+    "NOMINAL_2_BOUNDARY_NOISE": 60000,
+    "NOMINAL_3_SHARED_BIAS": 60000,
+    "NOMINAL_4_LOW_BRAKING": 60000,
+    "NOMINAL_5_SENSOR_DELAY": 60000,
+    "NOMINAL_6_ADVERSE_COMPOUND": 60000,
+    "SHIFT_1_DEGRADED_BRAKE": 10000,
+    "SHIFT_2_DOUBLE_NOISE": 10000,
+    "SHIFT_3_COMMON_BIAS_EXTREME": 10000,
+    "SHIFT_4_OBS_DROPOUT_500MS": 10000,
+    "SHIFT_5_SURFACE_DISTRIBUTION": 10000,
+    "SHIFT_6_SIMULTANEOUS_FAULTS": 10000
+  },
+  "sha256_canonical_digest": "7fd2f7cefdbeae57c4408f795f460a947937087d13a0ecc4c1d70c1a772f38fe"
+}

@@ -1,48 +1,19 @@
 """
-sim.sensors.pipeline - Synthetic dual-sensor pipeline for the stopping benchmark.
-
-Models two independent range sensors (a Time-of-Flight sensor and an
-ultrasonic sensor) plus a wheel encoder, all reading the same underlying
-ground-truth cart state, and a discretization engine that turns their
-continuous readings into the boolean evidence variables a downstream
-hazard-evaluation DAG would consume.
-
-Physical model
---------------
-Given ground-truth range d_true = x_obs - x_cart and ground-truth velocity
-v_true (the caller's responsibility to compute -- this module has no
-dependency on sim.plant, it takes d_true/v_true as plain floats):
-
-    d_ToF   = max(0.0, d_true + b_shared + N(0, sigma=0.02 * noise_scale))
-    d_ultra = max(0.0, d_true + b_shared + N(0, sigma=0.04 * noise_scale))
-    v_meas  = max(0.0, v_true + N(0, sigma=0.01))
-
-`b_shared` (sensor_bias) and `noise_scale` (sensor_noise_scale) are fixed per
-SensorPipeline instance -- they represent one episode's constant sensor
-characteristics, per sim.scenarios.strata.ScenarioInstance. d_true, v_true,
-and delta_t_sample vary per call, once per simulation timestep.
-
-Determinism: one SensorPipeline owns exactly one random.Random stream,
-constructed once from an integer seed; every sample() call draws from it in
-a fixed order (ToF noise, then ultrasonic noise, then encoder noise), so
-replaying the same seed against the same sequence of (d_true, v_true) calls
-reproduces bit-identical readings. __slots__ keeps a pipeline's own
-per-instance footprint to its three fields (no per-instance __dict__), and
-sample()/discretize() allocate nothing beyond the one SensorReading /
-DiscreteEvidence they return -- no lists, buffers, or intermediate
-collections -- so a batch run's steady-state memory use does not grow with
-the number of samples taken.
+Dual-sensor observation pipeline with unbiased cumulative encoder physics,
+tri-state range literals, and literal observation dropouts.
 """
 
-import hashlib
-import random
 from dataclasses import dataclass
-from typing import Tuple
+import math
+import random
+from typing import Optional
 
-TOF_NOISE_SIGMA_BASE = 0.02  # m, at sensor_noise_scale = 1.0
-ULTRASONIC_NOISE_SIGMA_BASE = 0.04  # m, at sensor_noise_scale = 1.0
-ENCODER_NOISE_SIGMA = 0.01  # m/s, fixed (not scaled by sensor_noise_scale)
+from sim.scenarios.strata import ScenarioInstance, derive_domain_seed
 
+TICK_PITCH = 0.0005  # 0.5 mm per tick (high-resolution optical wheel encoder)
+TOF_NOISE_SIGMA = 0.02
+ULTRA_NOISE_SIGMA = 0.04
+ENCODER_NOISE_SIGMA = 0.01
 D_CRITICAL_THRESHOLD_M = 0.30
 D_MARGINAL_THRESHOLD_M = 0.65
 V_HIGH_THRESHOLD_MPS = 0.35
@@ -52,95 +23,113 @@ TELEMETRY_STALE_THRESHOLD_S = 0.05
 
 
 @dataclass(frozen=True)
-class SensorReading:
-    """One timestep's continuous sensor outputs."""
-
-    d_tof: float  # m, ToF range reading (clamped >= 0.0)
-    d_ultra: float  # m, ultrasonic range reading (clamped >= 0.0)
-    v_meas: float  # m/s, wheel-encoder velocity reading (clamped >= 0.0)
-    delta_t_sample: float  # s, time elapsed since the previous sample
-
-
-@dataclass(frozen=True)
-class DiscreteEvidence:
-    """Boolean DAG evidence derived from one SensorReading."""
-
-    d_critical: bool  # min(d_tof, d_ultra) < 0.30 m
-    d_marginal: bool  # 0.30 m <= min(d_tof, d_ultra) < 0.65 m
-    v_high: bool  # v_meas >= 0.35 m/s
-    v_med: bool  # 0.15 m/s <= v_meas < 0.35 m/s
-    sensor_disagree: bool  # |d_tof - d_ultra| > 0.08 m
-    telemetry_stale: bool  # delta_t_sample > 0.05 s (50 ms)
-
-
-def derive_sensor_seed(episode_seed: int) -> int:
-    """
-    Derive a sensor-stream seed from an episode's own seed, independent of
-    the RNG stream sim.scenarios.generator used to draw that episode's
-    physical parameters -- same SHA-256 salting convention as
-    sim.scenarios.generator.derive_seed, with a ':sensors' suffix so the two
-    streams never coincide even when starting from the same episode_seed.
-    """
-    key = f"{episode_seed}:sensors"
-    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16)
+class SensorObservation:
+    timestamp: float
+    d_tof: Optional[float]
+    d_ultra: Optional[float]
+    v_measured: float
+    d_critical: Optional[bool]     # None when unobserved/dropout
+    d_marginal: Optional[bool]     # None when unobserved/dropout
+    v_high: bool
+    v_med: bool
+    sensor_disagree: Optional[bool] # None when unobserved/dropout
+    telemetry_stale: bool
 
 
 class SensorPipeline:
-    """
-    One episode's dual-sensor + wheel-encoder pipeline: fixed sensor_bias and
-    sensor_noise_scale (constant for the episode), a private deterministic
-    RNG stream, and per-timestep sample() / discretize() / read() calls.
-    """
+    def __init__(self, master_seed: str, scenario: ScenarioInstance):
+        self.scenario = scenario
+        self.last_valid_timestamp: float = 0.0
 
-    __slots__ = ("_rng", "sensor_bias", "sensor_noise_scale")
+        # Stateful encoder tracking:
+        # True physical displacement is accumulated uncorrupted.
+        # Optical detector phase jitter is applied directly at readout without clamping rectification.
+        self.cumulative_true_pos_m: float = 0.0
+        self.last_encoder_time: Optional[float] = None
+        self.cumulative_ticks: int = 0
 
-    def __init__(self, seed: int, sensor_bias: float, sensor_noise_scale: float) -> None:
-        self._rng = random.Random(seed)
-        self.sensor_bias = sensor_bias
-        self.sensor_noise_scale = sensor_noise_scale
+        tof_seed = derive_domain_seed(master_seed, scenario.stratum.name, scenario.episode_id, "tof")
+        ultra_seed = derive_domain_seed(master_seed, scenario.stratum.name, scenario.episode_id, "ultra")
+        enc_seed = derive_domain_seed(master_seed, scenario.stratum.name, scenario.episode_id, "encoder")
 
-    @classmethod
-    def from_scenario(cls, instance, seed: int = None) -> "SensorPipeline":
-        """
-        Convenience constructor: sensor_bias/sensor_noise_scale are read off
-        a sim.scenarios.strata.ScenarioInstance (duck-typed -- any object
-        with those two attributes works, so this module still does not need
-        to import sim.scenarios). The RNG seed defaults to
-        derive_sensor_seed(instance.seed) unless explicitly overridden.
-        """
-        if seed is None:
-            seed = derive_sensor_seed(instance.seed)
-        return cls(seed=seed, sensor_bias=instance.sensor_bias, sensor_noise_scale=instance.sensor_noise_scale)
+        self.rng_tof = random.Random(tof_seed)
+        self.rng_ultra = random.Random(ultra_seed)
+        self.rng_enc = random.Random(enc_seed)
 
-    def sample(self, d_true: float, v_true: float, delta_t_sample: float = 0.0) -> SensorReading:
-        """Draw one timestep's noisy sensor readings from ground truth."""
-        d_tof = d_true + self.sensor_bias + self._rng.gauss(0.0, TOF_NOISE_SIGMA_BASE * self.sensor_noise_scale)
-        d_ultra = d_true + self.sensor_bias + self._rng.gauss(
-            0.0, ULTRASONIC_NOISE_SIGMA_BASE * self.sensor_noise_scale
+    def sample(
+        self, t: float, current_x: float, current_v: float, dt_sample: float = 0.01
+    ) -> SensorObservation:
+        """Evaluates sensor readings and discretization at timestamp t."""
+        d_true = max(0.0, self.scenario.obstacle_position - current_x)
+
+        # Check for literal telemetry dropout
+        in_dropout = False
+        if self.scenario.dropout_duration_s > 0.0:
+            d_start = self.scenario.dropout_start_s
+            d_end = d_start + self.scenario.dropout_duration_s
+            if d_start <= t < d_end:
+                in_dropout = True
+
+        if in_dropout:
+            d_tof = None
+            d_ultra = None
+            d_critical = None
+            d_marginal = None
+            sensor_disagree = None
+            telemetry_stale = True
+        else:
+            scale = self.scenario.sensor_noise_scale
+            noise_tof = self.rng_tof.gauss(0.0, TOF_NOISE_SIGMA * scale)
+            noise_ultra = self.rng_ultra.gauss(0.0, ULTRA_NOISE_SIGMA * scale)
+
+            raw_tof = d_true + self.scenario.sensor_bias + noise_tof
+            raw_ultra = d_true + self.scenario.sensor_bias + noise_ultra
+
+            d_tof = max(0.0, raw_tof)
+            d_ultra = max(0.0, raw_ultra)
+            self.last_valid_timestamp = t
+            telemetry_stale = (t - self.last_valid_timestamp) > TELEMETRY_STALE_THRESHOLD_S
+
+            d_min = min(d_tof, d_ultra)
+            d_critical = d_min < D_CRITICAL_THRESHOLD_M
+            d_marginal = D_CRITICAL_THRESHOLD_M <= d_min < D_MARGINAL_THRESHOLD_M
+            sensor_disagree = abs(d_tof - d_ultra) > SENSOR_DISAGREE_THRESHOLD_M
+
+        # Stateful incremental encoder physics (unbiased noise model)
+        if self.last_encoder_time is None:
+            dt_enc = 0.0
+            self.last_encoder_time = t
+        else:
+            dt_enc = max(0.0, t - self.last_encoder_time)
+            self.last_encoder_time = t
+
+        # Accumulate exact continuous physical wheel motion (no rectification bias)
+        if current_v > 0.0 and dt_enc > 0.0:
+            self.cumulative_true_pos_m += current_v * dt_enc
+
+        # Sensor phase jitter applies to optical edge detection without mutating accumulated distance
+        optical_jitter = self.rng_enc.gauss(0.0, 0.00002) if current_v > 0.0 else 0.0
+        effective_readout_pos = max(0.0, self.cumulative_true_pos_m + optical_jitter)
+
+        current_ticks = math.floor(effective_readout_pos / TICK_PITCH)
+        delta_ticks = max(0, current_ticks - self.cumulative_ticks)
+        self.cumulative_ticks = current_ticks
+
+        eff_dt = dt_enc if dt_enc > 0.0 else dt_sample
+        v_measured = max(0.0, (delta_ticks * TICK_PITCH) / eff_dt)
+
+        v_high = v_measured >= V_HIGH_THRESHOLD_MPS
+        v_med = V_MED_THRESHOLD_MPS <= v_measured < V_HIGH_THRESHOLD_MPS
+
+        return SensorObservation(
+            timestamp=t,
+            d_tof=d_tof,
+            d_ultra=d_ultra,
+            v_measured=v_measured,
+            d_critical=d_critical,
+            d_marginal=d_marginal,
+            v_high=v_high,
+            v_med=v_med,
+            sensor_disagree=sensor_disagree,
+            telemetry_stale=telemetry_stale,
         )
-        v_meas = v_true + self._rng.gauss(0.0, ENCODER_NOISE_SIGMA)
-
-        return SensorReading(
-            d_tof=max(0.0, d_tof),
-            d_ultra=max(0.0, d_ultra),
-            v_meas=max(0.0, v_meas),
-            delta_t_sample=delta_t_sample,
-        )
-
-    @staticmethod
-    def discretize(reading: SensorReading) -> DiscreteEvidence:
-        """Map one SensorReading's continuous values to boolean DAG evidence."""
-        d_min = min(reading.d_tof, reading.d_ultra)
-        return DiscreteEvidence(
-            d_critical=d_min < D_CRITICAL_THRESHOLD_M,
-            d_marginal=D_CRITICAL_THRESHOLD_M <= d_min < D_MARGINAL_THRESHOLD_M,
-            v_high=reading.v_meas >= V_HIGH_THRESHOLD_MPS,
-            v_med=V_MED_THRESHOLD_MPS <= reading.v_meas < V_HIGH_THRESHOLD_MPS,
-            sensor_disagree=abs(reading.d_tof - reading.d_ultra) > SENSOR_DISAGREE_THRESHOLD_M,
-            telemetry_stale=reading.delta_t_sample > TELEMETRY_STALE_THRESHOLD_S,
-        )
-
-    def read(self, d_true: float, v_true: float, delta_t_sample: float = 0.0) -> Tuple[SensorReading, DiscreteEvidence]:
-        """Sample and discretize in one call."""
-        reading = self.sample(d_true, v_true, delta_t_sample)
-        return reading, self.discretize(reading)
