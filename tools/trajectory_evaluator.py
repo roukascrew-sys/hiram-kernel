@@ -29,7 +29,6 @@ def solve_step_kinematics_and_contact(
     """
     # 0. Immediate boundary check: initial contact or initial penetration
     if obstacle_x is not None and x0 >= obstacle_x:
-        # Starting at or beyond the obstacle boundary is immediate contact at t=0
         return obstacle_x, v0, True, 0.0, v0
 
     # 1. Kinematic trajectory segmentation over dt
@@ -248,6 +247,24 @@ class TrajectoryEvaluator:
         Executes a closed-loop discrete-time simulation episode.
         Terminates immediately at first contact or when cart stops.
         """
+        # Check for immediate starting contact or penetration at t=0
+        if obstacle_x is not None and initial_x >= obstacle_x:
+            impact_e = 0.5 * self.cart_mass * (initial_v * initial_v)
+            return TrajectoryResult(
+                time_history=[0.0],
+                x_history=[obstacle_x],
+                v_history=[initial_v],
+                a_history=[0.0],
+                action_history=[],  # Zero decisions executed before contact
+                collision=True,
+                contact_time=0.0,
+                contact_velocity=initial_v,
+                impact_energy=impact_e,
+                final_x=obstacle_x,
+                final_v=initial_v,
+                total_time=0.0,
+            )
+
         t = 0.0
         x = initial_x
         v = initial_v
@@ -258,24 +275,6 @@ class TrajectoryEvaluator:
         v_hist: List[float] = [v]
         a_hist: List[float] = [a]
         action_hist: List[str] = []
-
-        # Check for immediate starting contact/penetration
-        if obstacle_x is not None and initial_x >= obstacle_x:
-            impact_e = 0.5 * self.cart_mass * (initial_v * initial_v)
-            return TrajectoryResult(
-                time_history=t_hist,
-                x_history=x_hist,
-                v_history=v_hist,
-                a_history=a_hist,
-                action_history=["EMERGENCY_BRAKE"],
-                collision=True,
-                contact_time=0.0,
-                contact_velocity=initial_v,
-                impact_energy=impact_e,
-                final_x=obstacle_x,
-                final_v=initial_v,
-                total_time=0.0,
-            )
 
         a_brake_mag = self._get_braking_deceleration(
             track_condition, decel_capability, override_brake_decel
@@ -319,7 +318,6 @@ class TrajectoryEvaluator:
             )
 
             if step_coll:
-                # Freeze state and terminate at exact first contact point
                 contact_time = t + c_dt
                 contact_velocity = c_v
                 impact_energy = 0.5 * self.cart_mass * (c_v * c_v)

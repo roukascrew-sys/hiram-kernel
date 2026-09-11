@@ -163,7 +163,7 @@ class TestTrajectoryVerification(unittest.TestCase):
         self.assertLess(res.final_x, 0.80)
 
     def test_initial_boundary_contact_episode_termination(self):
-        """Astra Probe: starting at x=obstacle_x=0.20 m, v=0.35 m/s immediately terminates."""
+        """Astra Probe 1: starting at x=obstacle_x=0.20 m, v=0.35 m/s reports empty action history."""
         res = self.evaluator.run_episode(
             initial_x=0.20,
             initial_v=0.35,
@@ -171,11 +171,27 @@ class TestTrajectoryVerification(unittest.TestCase):
             obstacle_x=0.20,
         )
         self.assertTrue(res.collision)
+        self.assertEqual(res.action_history, [])
         self.assertEqual(res.contact_time, 0.0)
         self.assertEqual(res.contact_velocity, 0.35)
         self.assertEqual(res.final_x, 0.20)
         self.assertEqual(res.final_v, 0.35)
-        self.assertEqual(res.total_time, 0.0)
+        self.assertEqual(res.x_history[-1], 0.20)
+
+    def test_initial_penetration_boundary_normalization(self):
+        """Astra Probe 2: initial_x=0.21, obstacle_x=0.20 normalizes final state and history."""
+        res = self.evaluator.run_episode(
+            initial_x=0.21,
+            initial_v=0.35,
+            max_duration=2.0,
+            obstacle_x=0.20,
+        )
+        self.assertTrue(res.collision)
+        self.assertEqual(res.action_history, [])
+        self.assertEqual(res.final_x, 0.20)
+        self.assertEqual(res.x_history[-1], 0.20)
+        self.assertEqual(res.contact_time, 0.0)
+        self.assertEqual(res.contact_velocity, 0.35)
 
     def test_termination_at_first_contact_freezes_state(self):
         """Cart hitting an obstacle terminates at impact time; does not advance beyond."""
@@ -236,13 +252,11 @@ class TestTrajectoryVerification(unittest.TestCase):
         self.assertIsNotNone(res_mitigated.contact_velocity)
         self.assertIsNotNone(res_mitigated.impact_energy)
 
-        # Early braking reaction time deadline: must brake within 20 ms of detection
         first_brake_step = next(
             i for i, a in enumerate(res_mitigated.action_history) if a == "EMERGENCY_BRAKE"
         )
         self.assertLessEqual(first_brake_step * eval_kernel.dt, 0.020)
 
-        # Kinetic energy attenuation verification
         mitigated_energy = res_mitigated.impact_energy
         attenuation = (baseline_energy - mitigated_energy) / baseline_energy
         self.assertGreaterEqual(
