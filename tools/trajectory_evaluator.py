@@ -34,6 +34,20 @@ silently integrate across a kink in the dynamics -- specialized here to a
 closed form, since both kinks (v=0, v=v_cruise) have exact algebraic
 solutions for constant acceleration.
 
+Collision is a third such kink, and it gets the same treatment (hardened
+per audit review of commit 39ba0dd8, which found the original collision
+check compared the *end-of-step* position against obstacle_x after a full,
+obstacle-oblivious dt of integration -- so a step that stopped the cart
+exactly at its true kinematic limit past the obstacle reported the
+already-stopped v=0.0 as the "impact velocity", when the cart in fact
+passed the obstacle earlier in that same step at a strictly higher speed).
+_advance_physics_with_collision(x, v, a, dt, t, obstacle_x) checks whether
+the full-step (obstacle-oblivious) displacement would reach or exceed
+obstacle_x - x while v > 0; if so, it isolates the exact contact instant
+via Torricelli's equation (v_contact^2 = v^2 + 2*a*d) rather than reporting
+whatever _advance_physics's own v=0/v_cruise clamp produced for the full
+step.
+
 Evidence generation (deterministic continuous discretization)
 ----------------------------------------------------------------
 extract_evidence() no longer samples noisily from the causal DAG's CPTs (the
@@ -149,6 +163,16 @@ class TimestepRecord:
     true_obstacle_blocked: bool
 
 
+@dataclass(frozen=True)
+class ContactEvent:
+    """The exact kinematics of first contact with an obstacle, isolated
+    within the timestep it occurred in (see _advance_physics_with_collision)."""
+
+    contact_time: float
+    contact_velocity: float
+    impact_energy: float
+
+
 @dataclass
 class EpisodeResult:
     scenario: ScenarioInstance
@@ -157,9 +181,12 @@ class EpisodeResult:
     final_v: float
     duration_s: float
     steps: int
-    collided: bool
-    settled: bool  # True if the cart came to rest and stayed there (vs. hit max_duration_s / collided)
+    collision: bool
+    settled: bool  # True if the cart came to rest and stayed there (vs. hit max_duration_s / collision)
     clearance_m: Optional[float]  # obstacle_position - final_x, or None if there's no obstacle
+    contact_time: Optional[float] = None  # exact time of first contact, isolated within its timestep
+    contact_velocity: Optional[float] = None  # exact velocity at first contact (Torricelli), not a post-clamp value
+    impact_energy: Optional[float] = None  # 0.5 * mass * contact_velocity^2
     action_history: List[str] = field(default_factory=list)
     action_change_count: int = 0
     emergency_brake_engaged: bool = False
@@ -179,11 +206,16 @@ class TrajectoryEvaluator:
     states/profiles) against that same pair.
     """
 
-    def __init__(self, engine: BayesianInferenceEngine, scenario: ScenarioInstance) -> None:
+    def __init__(self, engine: BayesianInferenceEngine, scenario: ScenarioInstance, mass: float = 1.0) -> None:
         self.engine = engine
         self.scenario = scenario
         self.v_cruise = 0.50  # overwritten by run_episode() from the active profile; usable standalone too
         self._current_a = 0.0  # acceleration currently being applied, as read by extract_evidence()
+        # This benchmark otherwise carries no cart-mass concept anywhere
+        # (sim.plant/sim.scenarios are purely kinematic); 1.0 kg is a
+        # normalized default for impact_energy = 0.5*mass*v^2, not a value
+        # taken from elsewhere in the repo.
+        self.mass = mass
 
     # ------------------------------------------------------------------
     # Ground truth
@@ -312,6 +344,49 @@ class TrajectoryEvaluator:
 
         return x + v * dt, v
 
+    def _advance_physics_with_collision(
+        self, x: float, v: float, a: float, dt: float, t: float, obstacle_x: Optional[float]
+    ) -> Tuple[float, float, Optional[ContactEvent]]:
+        """
+        Wraps _advance_physics with intra-step collision resolution: if the
+        obstacle-oblivious full-step displacement would reach or exceed the
+        remaining distance to `obstacle_x` while v > 0, the exact contact
+        instant is isolated via Torricelli's equation rather than reporting
+        _advance_physics's own (obstacle-oblivious) end-of-step state.
+
+        Returns (x_next, v_next, contact_event_or_None). On contact,
+        x_next == obstacle_x and v_next == the exact contact velocity (not
+        whatever _advance_physics's v=0/v_cruise clamp would have produced
+        for the full, uninterrupted step).
+        """
+        if obstacle_x is not None and v > 0.0:
+            remaining = obstacle_x - x
+            if remaining <= 0.0:
+                # Already at/past the obstacle -- defensive: run_episode is
+                # expected to have already ended the episode before this can
+                # happen, since it checks for contact every step.
+                contact = ContactEvent(
+                    contact_time=t,
+                    contact_velocity=v,
+                    impact_energy=0.5 * self.mass * v * v,
+                )
+                return x, v, contact
+
+            x_full, v_full = self._advance_physics(x, v, a, dt)
+            if (x_full - x) >= remaining:
+                v_contact = math.sqrt(max(0.0, v * v + 2.0 * a * remaining))
+                dt_contact = (remaining / v) if abs(a) < 1e-12 else ((v_contact - v) / a)
+                contact = ContactEvent(
+                    contact_time=t + dt_contact,
+                    contact_velocity=v_contact,
+                    impact_energy=0.5 * self.mass * v_contact * v_contact,
+                )
+                return obstacle_x, v_contact, contact
+            return x_full, v_full, None
+
+        x_full, v_full = self._advance_physics(x, v, a, dt)
+        return x_full, v_full, None
+
     # ------------------------------------------------------------------
     # Episode rollout
     # ------------------------------------------------------------------
@@ -347,7 +422,10 @@ class TrajectoryEvaluator:
         fallback_event_count = 0
         emergency_brake_engaged = False
         first_emergency_brake_t: Optional[float] = None
-        collided = False
+        collision = False
+        contact_time: Optional[float] = None
+        contact_velocity: Optional[float] = None
+        impact_energy: Optional[float] = None
         settled = False
         consecutive_settled_steps = 0
         has_moved = False
@@ -367,14 +445,19 @@ class TrajectoryEvaluator:
         n_steps = max(1, math.ceil(profile.max_duration_s / profile.dt))
         for _ in range(n_steps):
             if t >= next_evidence_t - 1e-9:
-                obstacle_x = self.scenario.obstacle_position if self._obstacle_detectable(t, profile) else None
+                # The obstacle used for *evidence* is gated by detectability
+                # (the pop-up-obstacle mechanism); the *physical* obstacle
+                # used for collision resolution below is not -- a cart can
+                # be struck by an obstacle it hasn't sensed yet, which is
+                # exactly the pop-up-obstacle danger this evaluator models.
+                sensed_obstacle_x = self.scenario.obstacle_position if self._obstacle_detectable(t, profile) else None
                 if evidence_override is not None:
                     current_evidence = evidence_override(t)
                 else:
                     current_evidence = self.extract_evidence(
                         x,
                         v,
-                        obstacle_x,
+                        sensed_obstacle_x,
                         track_condition,
                         decel_capability,
                         t,
@@ -401,8 +484,10 @@ class TrajectoryEvaluator:
                 self._current_a = self._commanded_acceleration(current_action, profile)
 
             a_cmd = self._current_a
-            t_next = t + profile.dt
-            x, v = self._advance_physics(x, v, a_cmd, profile.dt)
+            x, v, contact = self._advance_physics_with_collision(
+                x, v, a_cmd, profile.dt, t, self.scenario.obstacle_position
+            )
+            t_next = contact.contact_time if contact is not None else t + profile.dt
 
             records.append(
                 TimestepRecord(
@@ -418,8 +503,12 @@ class TrajectoryEvaluator:
             )
             t = t_next
 
-            if self.scenario.obstacle_position is not None and x >= self.scenario.obstacle_position:
-                collided = True
+            if contact is not None:
+                if not collision:  # record only the first contact
+                    collision = True
+                    contact_time = contact.contact_time
+                    contact_velocity = contact.contact_velocity
+                    impact_energy = contact.impact_energy
                 break
 
             if v > 0.0:
@@ -448,9 +537,12 @@ class TrajectoryEvaluator:
             final_v=v,
             duration_s=t,
             steps=len(records),
-            collided=collided,
+            collision=collision,
             settled=settled,
             clearance_m=clearance_m,
+            contact_time=contact_time,
+            contact_velocity=contact_velocity,
+            impact_energy=impact_energy,
             action_history=action_history,
             action_change_count=action_change_count,
             emergency_brake_engaged=emergency_brake_engaged,

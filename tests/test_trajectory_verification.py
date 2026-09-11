@@ -1,21 +1,29 @@
 """
 Closed-loop integration & trajectory verification -- verification suite
-(Task 2.3, hardened per the Astra audit's HOLD findings on commit
-140b8a03).
+(Task 2.3, hardened per the Astra audit's HOLD findings on commits
+140b8a03 and 39ba0dd8).
 
 Covers: exact analytical partial-step physics (zero-velocity crossing and
-v_cruise clamping, both bit-precise, no overshoot for any dt), deterministic
-continuous evidence discretization (no randomness anywhere), nominal
-cruise-to-target-velocity with genuinely zero false emergency stops (trivial
-now that evidence has no noise), immediate EMERGENCY_BRAKE response to a
-pop-up obstacle with a bit-exact cross-check against sim.plant.
-analytic_plant's independent closed-form stopping-distance solution, a
-moving cart surviving a 500 ms telemetry blackout without collision, a
-SHIFT_6 constrained-clearance scenario meeting both an explicit <=20ms
-reaction-deadline requirement and a >=75% terminal-impact-kinetic-energy
-reduction versus an unmitigated baseline, forced zero-likelihood fallback
-producing a fail-safe stop, and focused unit tests of the evidence
-generator and zero-order-hold control-loop mechanics.
+v_cruise clamping, both bit-precise, no overshoot for any dt), exact
+*intra-step* collision kinematics (contact_time/contact_velocity/
+impact_energy isolated via Torricelli's equation, rather than reporting
+whatever velocity a full, obstacle-oblivious dt of integration happened to
+settle to -- the specific defect this hardening pass fixes, including the
+auditor's exact regression probe), deterministic continuous evidence
+discretization (no randomness anywhere), nominal cruise-to-target-velocity
+with genuinely zero false emergency stops (trivial now that evidence has no
+noise), immediate EMERGENCY_BRAKE response to a pop-up obstacle with a
+bit-exact cross-check against sim.plant.analytic_plant's independent
+closed-form stopping-distance solution, a moving cart surviving a 500 ms
+telemetry blackout without collision, a SHIFT_6 degraded-brake mitigation
+scenario (operational wheel telemetry -- sensor-blackout qualification is
+the moving-blackout tests' scope, not this one's) meeting both an explicit
+<=20ms reaction-deadline requirement and a >=75% terminal-impact-kinetic-
+energy reduction versus an unmitigated baseline (measured via
+contact_velocity/impact_energy on both sides, not post-braking final_v),
+forced zero-likelihood fallback producing a fail-safe stop, and focused
+unit tests of the evidence generator and zero-order-hold control-loop
+mechanics.
 
 Run directly:          python tests/test_trajectory_verification.py
 Verification command:  python -m unittest tests/test_trajectory_verification.py -v
@@ -53,25 +61,23 @@ def _far_obstacle(scenario):
     return dataclasses.replace(scenario, obstacle_position=1000.0)
 
 
-def _unmitigated_impact_velocity(evaluator: TrajectoryEvaluator, v0: float, obstacle_x: float, profile: TrajectoryProfile) -> float:
+def _unmitigated_impact_result(evaluator: TrajectoryEvaluator, v0: float, profile: TrajectoryProfile):
     """
-    Rolls out the same exact physics with the control law hard-wired to
-    ACCEL forever (no perception, no braking reaction at all) until reaching
-    `obstacle_x`, and returns the impact velocity. Used as the "unmitigated"
-    baseline for kinetic-energy-reduction comparisons -- an apples-to-apples
-    physics comparison since it reuses the evaluator's own
-    _advance_physics/_commanded_acceleration.
+    Rolls out a full episode with evidence forced to always read CLEAR (no
+    perception of the obstacle, no braking reaction at all), and returns the
+    resulting EpisodeResult. Used as the "unmitigated" baseline for
+    kinetic-energy-reduction comparisons: since this goes through the same
+    run_episode() and _advance_physics_with_collision() as the mitigated
+    run, both sides of the comparison get their contact_velocity/
+    impact_energy from the same exact intra-step collision resolution --
+    not a hand-rolled physics loop with its own (potentially different)
+    end-of-step overshoot behavior.
     """
-    evaluator.v_cruise = profile.v_cruise
-    x, v, t = 0.0, v0, 0.0
-    max_ticks = math.ceil(profile.max_duration_s / profile.dt)
-    for _ in range(max_ticks):
-        if x >= obstacle_x:
-            break
-        a = evaluator._commanded_acceleration("ACCEL", profile)
-        x, v = evaluator._advance_physics(x, v, a, profile.dt)
-        t += profile.dt
-    return v
+    return evaluator.run_episode(
+        PlantState(position=0.0, velocity=v0, acceleration=0.0),
+        profile,
+        evidence_override=lambda t: {"LidarObs": 0, "TofObs": 0, "WheelSlipObs": 0},
+    )
 
 
 class ExactPhysicsIntegrationTests(unittest.TestCase):
@@ -127,6 +133,108 @@ class ExactPhysicsIntegrationTests(unittest.TestCase):
         x, v = self.evaluator._advance_physics(2.0, 0.3, 0.0, 0.5)
         self.assertEqual(v, 0.3)
         self.assertAlmostEqual(x, 2.0 + 0.15, delta=1e-15)
+
+
+class IntraStepCollisionKinematicsTests(unittest.TestCase):
+    """
+    Regression coverage for the defect identified in audit review of commit
+    39ba0dd8: the original collision check compared *end-of-step* position
+    against obstacle_x after a full, obstacle-oblivious dt of integration,
+    so a step that stopped the cart exactly at its kinematic limit past the
+    obstacle reported the already-settled v=0.0 as the "impact velocity"
+    instead of the strictly higher velocity the cart actually had at the
+    moment it passed the obstacle, earlier in that same step.
+    """
+
+    def setUp(self):
+        scenario = generate_instance(DEFAULT_MASTER_SEED, StratumType.NOMINAL_1_STEADY, 0)
+        self.evaluator = TrajectoryEvaluator(_ENGINE, scenario)
+
+    def test_auditor_probe_direct_method_call(self):
+        # v0=0.01 m/s, a=-1.0 m/s^2, dt=0.010s: the full obstacle-oblivious
+        # step would travel v^2/(2|a|) = 50 um before settling to v=0.0 --
+        # but the obstacle is only 25 um away, half that distance, so true
+        # contact happens partway through the step at a strictly positive
+        # velocity: v_contact = sqrt(v0^2 + 2*a*d) = sqrt(0.0001 - 0.00005)
+        # = sqrt(0.00005) ~= 0.0070710678 m/s.
+        x, v, contact = self.evaluator._advance_physics_with_collision(
+            0.0, 0.01, -1.0, 0.010, 0.0, 0.000025
+        )
+        self.assertIsNotNone(contact)
+        self.assertEqual(x, 0.000025)
+        self.assertEqual(v, contact.contact_velocity)
+        self.assertTrue(math.isclose(contact.contact_velocity, 0.0070710678, rel_tol=1e-5))
+        self.assertGreater(contact.impact_energy, 0.0)
+        self.assertGreater(contact.contact_time, 0.0)
+        self.assertLess(contact.contact_time, 0.010)  # contact is strictly within the step
+
+    def test_auditor_probe_via_full_episode_result(self):
+        # The same probe, but exercised end to end through run_episode(),
+        # asserting on the exact field names the episode summary must
+        # expose: result.collision, result.contact_velocity,
+        # result.impact_energy.
+        scenario = dataclasses.replace(
+            generate_instance(DEFAULT_MASTER_SEED, StratumType.NOMINAL_1_STEADY, 0),
+            obstacle_position=0.000025,
+            braking_deceleration=1.0,
+        )
+        evaluator = TrajectoryEvaluator(_ENGINE, scenario)
+        profile = TrajectoryProfile(obstacle_appears_at_s=0.0, dt=0.010, evidence_period_s=0.010, max_duration_s=1.0)
+        result = evaluator.run_episode(
+            PlantState(position=0.0, velocity=0.01, acceleration=0.0),
+            profile,
+            evidence_override=lambda t: {"LidarObs": 1, "TofObs": 1, "WheelSlipObs": 0},
+        )
+
+        self.assertTrue(result.collision is True)
+        self.assertTrue(math.isclose(result.contact_velocity, 0.0070710678, rel_tol=1e-5))
+        self.assertGreater(result.impact_energy, 0.0)
+
+    def test_no_collision_case_leaves_contact_fields_none(self):
+        x, v, contact = self.evaluator._advance_physics_with_collision(
+            0.0, 0.01, -1.0, 0.010, 0.0, 1.0  # obstacle far away -- cart stops well short of it
+        )
+        self.assertIsNone(contact)
+
+    def test_independent_torricelli_cross_check_across_multiple_combinations(self):
+        # Compares the method's contact_velocity against a Torricelli
+        # prediction computed independently in this test (not by calling
+        # into the same formula inside the evaluator), across a spread of
+        # (v0, a, d_clear) combinations. Each combination's own stopping
+        # distance (v0^2/(2|a|)) exceeds d_clear, so the obstacle would
+        # eventually be reached if given long enough -- dt is set to more
+        # than twice each case's own full-stop time so the single-step,
+        # obstacle-oblivious displacement actually reaches that far within
+        # this one call (a too-small dt would correctly report *no*
+        # collision this step, which is a different, valid code path
+        # covered by test_no_collision_case_leaves_contact_fields_none).
+        cases = [
+            (0.01, -1.0, 0.000025),
+            (0.5, -0.2, 0.3),
+            (0.3, -0.177, 0.1),
+            (1.0, -0.5, 0.5),
+            (0.05, -10.0, 0.0001),
+            (0.2, -0.05, 0.15),
+        ]
+        for v0, a, d_clear in cases:
+            t_stop = v0 / abs(a)
+            self.assertGreater(v0 * v0 / (2.0 * abs(a)), d_clear)  # test setup sanity: obstacle is reachable
+            dt = 2.0 * t_stop + 1.0
+            with self.subTest(v0=v0, a=a, d_clear=d_clear, dt=dt):
+                expected_v_contact = math.sqrt(max(0.0, v0 * v0 + 2.0 * a * d_clear))
+                x, v, contact = self.evaluator._advance_physics_with_collision(0.0, v0, a, dt, 0.0, d_clear)
+                self.assertIsNotNone(contact, f"expected a collision for {(v0, a, d_clear, dt)}")
+                self.assertAlmostEqual(contact.contact_velocity, expected_v_contact, delta=1e-9)
+                self.assertAlmostEqual(v, expected_v_contact, delta=1e-9)
+                self.assertAlmostEqual(x, d_clear, delta=1e-9)
+
+                expected_impact_energy = 0.5 * self.evaluator.mass * expected_v_contact ** 2
+                self.assertAlmostEqual(contact.impact_energy, expected_impact_energy, delta=1e-12)
+
+    def test_impact_energy_uses_the_evaluators_mass(self):
+        evaluator = TrajectoryEvaluator(_ENGINE, self.evaluator.scenario, mass=2.5)
+        _, _, contact = evaluator._advance_physics_with_collision(0.0, 0.01, -1.0, 0.010, 0.0, 0.000025)
+        self.assertAlmostEqual(contact.impact_energy, 0.5 * 2.5 * contact.contact_velocity ** 2, delta=1e-15)
 
 
 class DeterministicEvidenceDiscretizationTests(unittest.TestCase):
@@ -201,7 +309,7 @@ class NominalCruiseTests(unittest.TestCase):
         profile = TrajectoryProfile(obstacle_appears_at_s=None, max_duration_s=5.0)
         result = evaluator.run_episode(PlantState(position=0.0, velocity=0.0, acceleration=0.0), profile)
 
-        self.assertFalse(result.collided)
+        self.assertFalse(result.collision)
         self.assertEqual(result.false_emergency_stop_count, 0)
         self.assertEqual(result.final_v, profile.v_cruise)
         self.assertTrue(all(a == "ACCEL" for a in result.action_history))
@@ -226,7 +334,7 @@ class PopUpObstacleTests(unittest.TestCase):
 
         result = evaluator.run_episode(PlantState(position=0.0, velocity=0.0, acceleration=0.0), profile)
 
-        self.assertFalse(result.collided)
+        self.assertFalse(result.collision)
         self.assertTrue(result.emergency_brake_engaged)
         self.assertGreater(result.clearance_m, 0.0)
         self.assertGreaterEqual(result.clearance_m, profile.clearance_margin_m)
@@ -267,7 +375,7 @@ class MovingBlackoutTests(unittest.TestCase):
 
         result = evaluator.run_episode(PlantState(position=0.0, velocity=0.40, acceleration=0.0), profile)
 
-        self.assertFalse(result.collided)
+        self.assertFalse(result.collision)
         self.assertGreater(result.clearance_m, 0.0)
 
         # Each record's `t` is the *post-tick* time, but the evidence
@@ -300,12 +408,24 @@ class MovingBlackoutTests(unittest.TestCase):
 
 
 class Shift6ConstrainedClearanceTests(unittest.TestCase):
+    """
+    Scope: SHIFT_6 degraded-brake mitigation with fully operational wheel
+    telemetry (dropout_duration_s=0.0 -- these scenarios test whether
+    degraded braking capability alone still gets a meaningfully mitigated
+    outcome). Sensor-blackout qualification (whether a telemetry outage
+    itself is handled safely) is intentionally out of scope here; that is
+    MovingBlackoutTests' job, so it isn't duplicated/conflated with this
+    class's degraded-brake-specific assertions.
+    """
+
     def test_early_emergency_brake_deadline_and_impact_energy_reduction(self):
         # v0 = 0.35 m/s, SHIFT_6 degraded brakes, and the obstacle placed
         # exactly at the detection range (0.30 m) so it is detectable from
         # the very first perception update -- a maximally "constrained
         # clearance" scenario for these degraded brakes (stopping distance
-        # from cruise speed alone exceeds what 0.30 m of warning provides).
+        # from cruise speed alone exceeds what 0.30 m of warning provides,
+        # so this scenario does still end in contact even when mitigated;
+        # what mitigation buys is a drastically reduced contact velocity).
         shift6 = generate_instance(DEFAULT_MASTER_SEED, StratumType.SHIFT_6_SIMULTANEOUS_FAULTS, 0)
         self.assertLess(shift6.braking_deceleration, 0.2)  # confirms genuinely degraded brakes
         scenario = dataclasses.replace(shift6, obstacle_position=0.30, dropout_duration_s=0.0)
@@ -321,16 +441,28 @@ class Shift6ConstrainedClearanceTests(unittest.TestCase):
         self.assertIsNotNone(result.first_emergency_brake_t)
         self.assertLessEqual(result.first_emergency_brake_t, 0.020)  # <= 20 ms
 
-        # Terminal impact energy: compare against an unmitigated baseline
-        # (same exact physics, control law hard-wired to ACCEL the whole
-        # way) reaching the same obstacle position.
-        unmitigated_v = _unmitigated_impact_velocity(evaluator, v0, scenario.obstacle_position, profile)
-        self.assertGreater(unmitigated_v, 0.0)
+        # Terminal impact energy, computed strictly from contact_velocity/
+        # impact_energy (the exact intra-step contact kinematics), never
+        # from a post-braking clamped final_v -- on both the mitigated side
+        # and the unmitigated baseline, so the comparison is apples to
+        # apples through the same collision-resolution code path.
+        self.assertTrue(result.collision)
+        self.assertIsNotNone(result.contact_velocity)
+        self.assertIsNotNone(result.impact_energy)
 
-        mitigated_ke = result.final_v ** 2
-        unmitigated_ke = unmitigated_v ** 2
-        reduction = 1.0 - (mitigated_ke / unmitigated_ke)
-        self.assertGreaterEqual(reduction, 0.75, f"KE reduction only {reduction:.1%} (mitigated_v={result.final_v}, unmitigated_v={unmitigated_v})")
+        unmitigated = _unmitigated_impact_result(evaluator, v0, profile)
+        self.assertTrue(unmitigated.collision)
+        self.assertIsNotNone(unmitigated.contact_velocity)
+        self.assertGreater(unmitigated.contact_velocity, 0.0)
+
+        reduction = 1.0 - (result.impact_energy / unmitigated.impact_energy)
+        self.assertGreaterEqual(
+            reduction,
+            0.75,
+            f"KE reduction only {reduction:.1%} "
+            f"(mitigated contact_velocity={result.contact_velocity}, "
+            f"unmitigated contact_velocity={unmitigated.contact_velocity})",
+        )
 
     def test_combined_degraded_traction_and_dropout_still_avoids_collision(self):
         # With SHIFT_6's own built-in dropout window active (dropout_start=0,
@@ -349,7 +481,7 @@ class Shift6ConstrainedClearanceTests(unittest.TestCase):
         evaluator = TrajectoryEvaluator(_ENGINE, scenario)
 
         result = evaluator.run_episode(PlantState(position=0.0, velocity=0.0, acceleration=0.0), profile)
-        self.assertFalse(result.collided)
+        self.assertFalse(result.collision)
         self.assertGreater(result.clearance_m, 0.0)
         self.assertTrue(result.emergency_brake_engaged)
 
@@ -376,7 +508,7 @@ class FallbackFailSafeTests(unittest.TestCase):
         finally:
             _ENGINE._sensor_cpt["LidarObs"] = original_lidar_cpt
 
-        self.assertFalse(result.collided)
+        self.assertFalse(result.collision)
         self.assertEqual(result.fallback_event_count, len(result.action_history))
         self.assertTrue(all(a == "EMERGENCY_BRAKE" for a in result.action_history))
         self.assertEqual(result.final_v, 0.0)
@@ -399,7 +531,7 @@ class ControlLoopMechanicsTests(unittest.TestCase):
 
         self.assertIsInstance(result.final_x, float)
         self.assertIsInstance(result.final_v, float)
-        self.assertIsInstance(result.collided, bool)
+        self.assertIsInstance(result.collision, bool)
         self.assertIsInstance(result.action_history, list)
         self.assertGreater(len(result.records), 0)
         self.assertTrue(all(math.isfinite(r.x) and math.isfinite(r.v) for r in result.records))
