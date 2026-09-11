@@ -64,28 +64,39 @@ typedef enum {
     HIRAM_ERR_NULL_POINTER = 3,
 } hiram_status_t;
 
+/* Alias onto the generated table macro so this header's struct definition
+ * can be stated in terms of a stable, kernel-facing name rather than
+ * hiram_tables.h's export-pipeline-internal one -- both always refer to
+ * the same single source of truth (HIRAM_N_OBSTACLE * HIRAM_N_DECEL = 6). */
+#define HIRAM_POSTERIOR_STATES HIRAM_N_POSTERIOR
+
 /*
  * Caller-owned scratch memory for hiram_kernel_step(). Kept as an explicit
  * struct (rather than function-local arrays) so a caller can place it in a
  * specific memory region via linker/section attributes, and so the kernel
- * itself never needs a stack VLA. Statically sized from the compiled-in
- * model tables, and (by construction, for this 6-node cart model) many
- * orders of magnitude under the 40 KB Cortex-M7 DTCM budget this task
- * targets -- see the compile-time size assertion below.
+ * itself never needs a stack VLA. The actual implemented footprint is a
+ * single 6-double scratchpad (48 bytes) -- see the compile-time size
+ * assertions below, which pin down both that exact figure (so any
+ * accidental growth is caught immediately) and the < 40 KB Cortex-M7 DTCM
+ * ceiling this task targets.
  */
 typedef struct {
-    double unnormalized_joint[HIRAM_N_POSTERIOR];
+    double posterior_scratch[HIRAM_POSTERIOR_STATES];
 } hiram_workspace_t;
 
-/* Compile-time enforcement of the < 40 KB DTCM workspace budget (C99: no
- * _Static_assert, so use the classic negative-array-size trick). */
+/* Compile-time enforcement (C99: no _Static_assert, so use the classic
+ * negative-array-size trick) -- both the exact reconciled footprint (6
+ * doubles = 48 bytes) and the hard upper bound this task targets. */
+typedef char hiram_workspace_is_48_bytes[(sizeof(hiram_workspace_t) == 48) ? 1 : -1];
 typedef char hiram_workspace_fits_budget[(sizeof(hiram_workspace_t) <= 40960) ? 1 : -1];
 
 typedef struct {
     double posterior[HIRAM_N_POSTERIOR];       /* P(TrueObstacle=o, DecelCapability=d | evidence), index o * HIRAM_N_DECEL + d */
     double expected_losses[HIRAM_N_ACTIONS];   /* index matches HIRAM_ACTION_* / HIRAM_ACTION_NAMES */
     int32_t selected_action;                  /* one of HIRAM_ACTION_ACCEL / HIRAM_ACTION_COAST / HIRAM_ACTION_EMERGENCY_BRAKE */
-    bool fallback_active;                      /* true iff the zero-likelihood prior fallback fired (action is always EMERGENCY_BRAKE in that case) */
+    int32_t selected_action_index;            /* always equal to selected_action; kept as a distinct field per the kernel's explicit output contract */
+    bool fallback_active;                      /* true iff the zero-likelihood prior fallback OR an invalid-evidence safety fallback fired (action is always EMERGENCY_BRAKE in that case) */
+    hiram_status_t status;                     /* the hiram_status_t this call returned; always mirrors the function's own return value */
 } hiram_decision_t;
 
 /*
@@ -118,9 +129,18 @@ hiram_status_t hiram_kernel_verify_custody(void);
  * Writes the result into `*out`; `*ws` is scratch space, contents undefined
  * on return.
  *
- * Returns HIRAM_ERR_NULL_POINTER if any pointer is NULL,
- * HIRAM_ERR_INVALID_EVIDENCE if an evidence field is outside
- * {HIRAM_UNOBSERVED} u [0, HIRAM_N_SENSOR_STATES), else HIRAM_OK.
+ * Returns HIRAM_ERR_NULL_POINTER if any pointer is NULL (evidence/ws/out
+ * are all left untouched in that case -- there is no `*out` to write into).
+ *
+ * Returns HIRAM_ERR_INVALID_EVIDENCE if an evidence field is outside
+ * {HIRAM_UNOBSERVED} u [0, HIRAM_N_SENSOR_STATES); *out is still fully
+ * populated in this case -- to the same safe EMERGENCY_BRAKE-over-the-prior
+ * fallback contract as the zero-likelihood path -- specifically so a
+ * caller reusing a `hiram_decision_t` across calls never observes a stale
+ * decision (e.g. an earlier call's ACCEL) left over from before the
+ * rejected call. `out->status` mirrors the return value on every path.
+ *
+ * Otherwise returns HIRAM_OK.
  */
 hiram_status_t hiram_kernel_step(const hiram_evidence_t *evidence, hiram_workspace_t *ws, hiram_decision_t *out);
 

@@ -261,6 +261,45 @@ static void test_out_of_range_evidence_rejected(void) {
                 "wheel_slip_obs=100 (out of range) should be rejected");
 }
 
+/*
+ * Deliberately reuses a single hiram_decision_t across two calls: a valid
+ * step (selects ACCEL), then an invalid one, to confirm the invalid call
+ * can never leave a stale decision (the previous call's ACCEL) sitting in
+ * *out* -- every field must be overwritten with the safe EMERGENCY_BRAKE
+ * fallback, never left untouched. See hiram_populate_safe_fallback in
+ * src/hiram_kernel.c.
+ */
+static void test_invalid_evidence_reused_output(void) {
+    const hiram_evidence_t valid_ev = {0, 0, 0};
+    hiram_workspace_t ws;
+    hiram_decision_t out;
+
+    HIRAM_CHECK(hiram_kernel_step(&valid_ev, &ws, &out) == HIRAM_OK, "initial valid step should succeed");
+    HIRAM_CHECK(out.selected_action == HIRAM_ACTION_ACCEL, "initial valid step should select ACCEL");
+
+    const hiram_evidence_t invalid_ev = {3, 0, 0};
+    const hiram_status_t rc = hiram_kernel_step(&invalid_ev, &ws, &out);
+
+    HIRAM_CHECK(rc == HIRAM_ERR_INVALID_EVIDENCE, "reused-output invalid step should return HIRAM_ERR_INVALID_EVIDENCE");
+    HIRAM_CHECK(out.selected_action == HIRAM_ACTION_EMERGENCY_BRAKE,
+                "reused-output invalid step must overwrite stale ACCEL with EMERGENCY_BRAKE");
+    HIRAM_CHECK(out.selected_action_index == 2, "reused-output invalid step must set selected_action_index to 2");
+    HIRAM_CHECK(out.fallback_active == true, "reused-output invalid step must set fallback_active");
+    HIRAM_CHECK(out.status == HIRAM_ERR_INVALID_EVIDENCE,
+                "reused-output invalid step must mirror the return code into out.status");
+
+    /* out->posterior must be the model's true prior (HIRAM_PRIOR_MARGINAL),
+     * not the stale posterior from the previous valid call. For this
+     * sealed model, P(TrueObstacle=CLEAR, DecelCapability=NOMINAL) (the
+     * prior's [0] entry) is 0.65205 -- independently confirmed against a
+     * live BayesianInferenceEngine()._prior_marginal[0], not merely
+     * against this kernel's own HIRAM_PRIOR_MARGINAL table. */
+    HIRAM_CHECK(doubles_nearly_equal(out.posterior[0], HIRAM_PRIOR_MARGINAL[0]),
+                "reused-output invalid step posterior[0] must equal the true prior HIRAM_PRIOR_MARGINAL[0]");
+    HIRAM_CHECK(fabs(out.posterior[0] - 0.65205) < 5e-4,
+                "reused-output invalid step posterior[0] should be this model's true prior, ~0.65205");
+}
+
 int main(void) {
     test_verify_custody();
     test_parity_full_clear();
@@ -271,6 +310,7 @@ int main(void) {
     test_all_64_dropout_combinations_match_unobserved();
     test_null_pointer_rejected();
     test_out_of_range_evidence_rejected();
+    test_invalid_evidence_reused_output();
 
     printf("hiram_kernel tests: %d checks run, %d failed\n", g_checks_run, g_checks_failed);
     return g_checks_failed == 0 ? 0 : 1;

@@ -17,38 +17,68 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-def check_c_symbol_table() -> bool:
-    """Rule 1: Prohibit heap allocations in compiled C static library."""
-    lib_path = REPO_ROOT / "build" / "libhiram_kernel.a"
-    
-    # If not built, attempt to build via make or gcc
-    if not lib_path.exists():
-        print("[CHECK] C static library missing. Attempting build via make...")
-        try:
-            res_build = subprocess.run(["make", "all"], cwd=str(REPO_ROOT), capture_output=True, text=True)
-            if res_build.returncode != 0:
-                print("[WARN] 'make all' failed or make not installed. Checking for direct gcc build...")
-        except FileNotFoundError:
-            print("[WARN] 'make' command not found in environment.")
-
-    if not lib_path.exists():
-        print("[SKIP] C static library build/libhiram_kernel.a not found. Proceeding with Python checks.")
-        return True
-
-    print("[CHECK] Scanning C symbol table for prohibited heap allocators...")
-    cmd = ["nm", str(lib_path)]
+def run_c_build_and_tests() -> bool:
+    """Rule 1: Full C pipeline gate -- `make clean && make all` (which itself
+    includes verify_zero_alloc), an independent symbol scan of
+    build/libhiram_kernel.a, and execution of the compiled C test binary.
+    Unlike the previous soft-skip-if-missing behavior, a missing toolchain
+    or a build/test failure is now a hard failure of this gate, not
+    something to silently pass past."""
+    print("[CHECK] Building C kernel via 'make clean && make all'...")
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        prohibited = ["malloc", "free", "calloc", "realloc", "alloca"]
-        for sym in prohibited:
-            if sym in res.stdout:
-                print(f"[FAIL] Prohibited dynamic memory symbol detected: {sym}")
-                return False
-        print("[PASS] Zero dynamic memory allocation verified.")
-        return True
+        res_clean = subprocess.run(["make", "clean"], cwd=str(REPO_ROOT), capture_output=True, text=True)
     except FileNotFoundError:
-        print("[WARN] 'nm' utility not found. Skipping symbol scan.")
-        return True
+        print("[FAIL] 'make' command not found in environment.")
+        return False
+    if res_clean.returncode != 0:
+        print("[FAIL] 'make clean' failed:")
+        print(res_clean.stdout)
+        print(res_clean.stderr)
+        return False
+
+    res_build = subprocess.run(["make", "all"], cwd=str(REPO_ROOT), capture_output=True, text=True)
+    print(res_build.stdout)
+    if res_build.returncode != 0:
+        print("[FAIL] 'make all' failed (build and/or verify_zero_alloc):")
+        print(res_build.stderr)
+        return False
+    print("[PASS] make all succeeded (build + verify_zero_alloc).")
+
+    lib_path = REPO_ROOT / "build" / "libhiram_kernel.a"
+    if not lib_path.exists():
+        print(f"[FAIL] Expected static library not found after build: {lib_path}")
+        return False
+
+    print("[CHECK] Independently scanning C symbol table for prohibited heap allocators...")
+    try:
+        res_nm = subprocess.run(["nm", str(lib_path)], capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        print("[FAIL] 'nm' utility not found in environment.")
+        return False
+    except subprocess.CalledProcessError as exc:
+        print(f"[FAIL] 'nm' failed on {lib_path}: {exc.stderr}")
+        return False
+    prohibited = ["malloc", "free", "calloc", "realloc", "alloca"]
+    for sym in prohibited:
+        if sym in res_nm.stdout:
+            print(f"[FAIL] Prohibited dynamic memory symbol detected: {sym}")
+            return False
+    print("[PASS] Zero dynamic memory allocation verified.")
+
+    print("[CHECK] Executing C test binary...")
+    candidates = [REPO_ROOT / "build" / "test_c_kernel.exe", REPO_ROOT / "build" / "test_c_kernel"]
+    test_bin = next((c for c in candidates if c.exists()), None)
+    if test_bin is None:
+        print(f"[FAIL] C test binary not found at {candidates[0]} or {candidates[1]}")
+        return False
+    res_test = subprocess.run([str(test_bin)], cwd=str(REPO_ROOT), capture_output=True, text=True)
+    print(res_test.stdout)
+    if res_test.returncode != 0:
+        print("[FAIL] C test binary reported failures:")
+        print(res_test.stderr)
+        return False
+    print("[PASS] C test binary passed all checks.")
+    return True
 
 
 def check_python_boundary_matrix() -> bool:
@@ -115,8 +145,13 @@ def main() -> None:
     print("   HIRAM PRE-AUDIT GATEKEEPER VERIFICATION        ")
     print("==================================================")
 
+    if not run_c_build_and_tests():
+        print("==================================================")
+        print(">>> PRE-AUDIT GATEKEEPER STATUS: FAILED <<<")
+        print("C build/test pipeline failed. Do NOT submit to auditor.")
+        sys.exit(1)
+
     ok = True
-    ok = ok and check_c_symbol_table()
     ok = ok and check_python_boundary_matrix()
     ok = ok and run_test_suite()
 

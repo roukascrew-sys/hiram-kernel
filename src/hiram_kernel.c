@@ -45,6 +45,43 @@ static int32_t hiram_canonicalize_evidence(int32_t v, int32_t dropout_index) {
     return v;
 }
 
+/* E[loss | action] = sum_{o,d} posterior[o,d] * loss[action,o,d], mirroring
+ * evaluate_expected_loss's dot product exactly. Factored out so both the
+ * normal inference path and the safe-fallback path below (zero-likelihood
+ * *and* invalid-evidence) populate expected_losses identically instead of
+ * one of them risking drifting out of step with the other. */
+static void hiram_evaluate_expected_losses(const double *posterior, double *expected_losses_out) {
+    int32_t a, i;
+    for (a = 0; a < HIRAM_N_ACTIONS; a++) {
+        double total = 0.0;
+        for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
+            total += posterior[i] * HIRAM_LOSS_MATRIX[a * HIRAM_LOSS_ACTION_STRIDE + i];
+        }
+        expected_losses_out[a] = total;
+    }
+}
+
+/*
+ * Populates `*out` with the conservative safe-fallback decision: the
+ * model's true prior, EMERGENCY_BRAKE, and fallback_active=true. Used both
+ * when evidence is contradictory/degenerate (zero-likelihood) and when
+ * evidence is outright invalid -- in the latter case specifically so a
+ * caller that reuses a `hiram_decision_t` across calls never observes a
+ * stale decision (e.g. an earlier call's ACCEL) left over from before the
+ * rejected call: every field is overwritten, never left untouched.
+ */
+static void hiram_populate_safe_fallback(hiram_decision_t *out, hiram_status_t status) {
+    int32_t i;
+    for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
+        out->posterior[i] = HIRAM_PRIOR_MARGINAL[i];
+    }
+    hiram_evaluate_expected_losses(out->posterior, out->expected_losses);
+    out->selected_action = HIRAM_EMERGENCY_BRAKE_INDEX;
+    out->selected_action_index = HIRAM_EMERGENCY_BRAKE_INDEX;
+    out->fallback_active = true;
+    out->status = status;
+}
+
 hiram_status_t hiram_kernel_verify_custody(void) {
     if (strcmp(HIRAM_FROZEN_IR_DIGEST, HIRAM_KERNEL_EXPECTED_IR_DIGEST) != 0) {
         return HIRAM_ERR_CUSTODY_MISMATCH;
@@ -54,11 +91,15 @@ hiram_status_t hiram_kernel_verify_custody(void) {
 
 hiram_status_t hiram_kernel_step(const hiram_evidence_t *evidence, hiram_workspace_t *ws, hiram_decision_t *out) {
     if (evidence == NULL || ws == NULL || out == NULL) {
+        /* No `*out` to safely write into (it may itself be the NULL
+         * pointer) -- nothing to reconcile here, unlike the invalid-
+         * evidence case below. */
         return HIRAM_ERR_NULL_POINTER;
     }
     if (!hiram_evidence_value_in_range(evidence->lidar_obs) ||
         !hiram_evidence_value_in_range(evidence->tof_obs) ||
         !hiram_evidence_value_in_range(evidence->wheel_slip_obs)) {
+        hiram_populate_safe_fallback(out, HIRAM_ERR_INVALID_EVIDENCE);
         return HIRAM_ERR_INVALID_EVIDENCE;
     }
 
@@ -68,7 +109,7 @@ hiram_status_t hiram_kernel_step(const hiram_evidence_t *evidence, hiram_workspa
 
     int32_t i;
     for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
-        ws->unnormalized_joint[i] = 0.0;
+        ws->posterior_scratch[i] = 0.0;
     }
 
     /* Direct marginalization over TrackCondition, mirroring
@@ -97,7 +138,7 @@ hiram_status_t hiram_kernel_step(const hiram_evidence_t *evidence, hiram_workspa
                     ? 1.0
                     : HIRAM_CPT_WHEELSLIPOBS[d * HIRAM_STRIDE_DECEL_TO_WHEEL + wheel_val];
 
-                ws->unnormalized_joint[o * HIRAM_N_DECEL + d] +=
+                ws->posterior_scratch[o * HIRAM_N_DECEL + d] +=
                     p_t * p_o_given_t * p_d_given_t * obstacle_evidence_factor * f_wheel;
             }
         }
@@ -105,7 +146,7 @@ hiram_status_t hiram_kernel_step(const hiram_evidence_t *evidence, hiram_workspa
 
     double likelihood = 0.0;
     for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
-        likelihood += ws->unnormalized_joint[i];
+        likelihood += ws->posterior_scratch[i];
     }
 
     const bool fallback_active = likelihood < HIRAM_ZERO_LIKELIHOOD_GUARD;
@@ -118,22 +159,16 @@ hiram_status_t hiram_kernel_step(const hiram_evidence_t *evidence, hiram_workspa
         }
     } else {
         for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
-            out->posterior[i] = ws->unnormalized_joint[i] / likelihood;
+            out->posterior[i] = ws->posterior_scratch[i] / likelihood;
         }
     }
 
     /* evaluate_expected_loss is unconditional in Python's step() (even on
      * the fallback path, to populate expected_losses for diagnostics) --
      * mirrored here the same way. */
-    int32_t a;
-    for (a = 0; a < HIRAM_N_ACTIONS; a++) {
-        double total = 0.0;
-        for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
-            total += out->posterior[i] * HIRAM_LOSS_MATRIX[a * HIRAM_LOSS_ACTION_STRIDE + i];
-        }
-        out->expected_losses[a] = total;
-    }
+    hiram_evaluate_expected_losses(out->posterior, out->expected_losses);
 
+    int32_t a;
     int32_t best_idx;
     if (fallback_active) {
         /* Python: the fallback path unconditionally overrides whatever
@@ -164,6 +199,8 @@ hiram_status_t hiram_kernel_step(const hiram_evidence_t *evidence, hiram_workspa
     }
 
     out->selected_action = best_idx;
+    out->selected_action_index = best_idx;
     out->fallback_active = fallback_active;
+    out->status = HIRAM_OK;
     return HIRAM_OK;
 }

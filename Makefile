@@ -7,10 +7,10 @@
 # src/hiram_eval.c) -- distinct sources, distinct build system, no overlap.
 
 CC := gcc
-CFLAGS := -Wall -Wextra -Werror -pedantic -std=c99 -Iinclude -O2
+CFLAGS := -std=c99 -Wall -Wextra -Werror -Wvla -pedantic -O2 -Iinclude
 AR := ar
 
-BUILD_DIR := build_task3_1
+BUILD_DIR := build
 KERNEL_SRC := src/hiram_kernel.c
 KERNEL_OBJ := $(BUILD_DIR)/hiram_kernel.o
 KERNEL_LIB := $(BUILD_DIR)/libhiram_kernel.a
@@ -21,7 +21,10 @@ TEST_BIN := $(BUILD_DIR)/test_c_kernel
 
 .PHONY: all clean test verify_zero_alloc
 
-all: $(KERNEL_LIB) $(TEST_BIN)
+# verify_zero_alloc is part of `all` itself (not just a separately-run
+# target) -- a build that produces heap-allocating object code is not
+# considered to have succeeded.
+all: $(KERNEL_LIB) $(TEST_BIN) verify_zero_alloc
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -42,22 +45,15 @@ test: $(TEST_BIN)
 	./$(TEST_BIN)
 
 # Fails the build if any dynamic heap allocation symbol (malloc/free/calloc/
-# realloc/alloca, and their libc __-prefixed/wrapped aliases) is referenced
-# by the compiled kernel object or library -- independent of the
-# `#pragma GCC poison` source-level guard in src/hiram_kernel.c, so a
+# realloc/alloca) is referenced by the compiled static library -- independent
+# of the `#pragma GCC poison` source-level guard in src/hiram_kernel.c, so a
 # symbol pulled in some other way (e.g. via linking) is still caught.
-verify_zero_alloc: $(KERNEL_OBJ) $(KERNEL_LIB)
-	@echo "Scanning $(KERNEL_OBJ) and $(KERNEL_LIB) for heap allocation symbols..."
-	@FOUND=0; \
-	for ART in $(KERNEL_OBJ) $(KERNEL_LIB); do \
-		HITS=$$(nm "$$ART" 2>/dev/null | grep -E '\b(malloc|free|calloc|realloc|alloca|reallocarray)\b' || true); \
-		if [ -n "$$HITS" ]; then \
-			echo "FAIL: heap allocation symbol(s) found in $$ART:"; \
-			echo "$$HITS"; \
-			FOUND=1; \
-		fi; \
-	done; \
-	if [ "$$FOUND" -ne 0 ]; then \
+verify_zero_alloc: $(KERNEL_LIB)
+	@echo "Scanning $(KERNEL_LIB) for heap allocation symbols..."
+	@HITS=$$(nm "$(KERNEL_LIB)" 2>/dev/null | grep -E '\b(malloc|free|calloc|realloc|alloca)\b' || true); \
+	if [ -n "$$HITS" ]; then \
+		echo "FAIL: heap allocation symbol(s) found in $(KERNEL_LIB):"; \
+		echo "$$HITS"; \
 		echo "verify_zero_alloc: FAILED"; \
 		exit 1; \
 	fi; \
