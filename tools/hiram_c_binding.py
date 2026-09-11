@@ -41,6 +41,41 @@ HIRAM_STATUS_NAMES = {
     3: "HIRAM_ERR_NULL_POINTER",
 }
 
+HIRAM_ERR_INVALID_EVIDENCE = 2
+
+# The only values hiram_evidence_t's int32 fields are ever valid for --
+# mirrors hiram_evidence_value_in_range() in src/hiram_kernel.c exactly.
+# ctypes.c_int32 silently *wraps* an out-of-range Python int at struct
+# assignment time (e.g. 2**32 -> 0, -(2**32) -> 0, 2**32 + 1 -> 1) rather
+# than raising, so that narrowing must never happen before this set has
+# been checked in full Python-int precision -- see
+# HiramCKernel._validate_sensor_value / .step().
+_VALID_SENSOR_VALUES = frozenset({HIRAM_UNOBSERVED, 0, 1, 2})
+
+
+def _validate_sensor_value(value: object, field_name: str) -> int:
+    """Validates one hiram_evidence_t field value in full Python-int
+    precision, before it is ever narrowed into a ctypes.c_int32. Raises
+    ValueError for anything outside {-1, 0, 1, 2} -- including values a
+    ctypes.c_int32 assignment would silently wrap into range (e.g.
+    2**32 == 0, -(2**32) == 0), non-integers (float, str, None), and bool
+    (which is technically an int subclass in Python but not a meaningful
+    sensor reading).
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"{field_name} must be an int in {{-1, 0, 1, 2}} (-1 = HIRAM_UNOBSERVED), "
+            f"got {value!r} ({type(value).__name__})"
+        )
+    if value not in _VALID_SENSOR_VALUES:
+        raise ValueError(
+            f"{field_name}={value!r} is out of range; must be one of {{-1, 0, 1, 2}} "
+            "(-1 = HIRAM_UNOBSERVED, 2 = DROPOUT) -- refusing to narrow this into a "
+            "ctypes.c_int32, which would silently wrap it (e.g. 2**32 -> 0) instead "
+            "of the C kernel's own HIRAM_ERR_INVALID_EVIDENCE rejection"
+        )
+    return value
+
 
 class HiramEvidence(ctypes.Structure):
     """Mirrors hiram_evidence_t (include/hiram_kernel.h)."""
@@ -141,7 +176,17 @@ class HiramCKernel:
         posterior / posterior_hex / expected_losses / expected_losses_hex /
         selected_action / selected_action_index / fallback_active -- plus a
         "status" field (the raw hiram_status_t) that the Python reference
-        has no equivalent for."""
+        has no equivalent for.
+
+        Raises ValueError if `lidar`/`tof`/`slip` is not an int in
+        {-1, 0, 1, 2} -- checked in full Python-int precision *before* any
+        ctypes.c_int32 field assignment, so an out-of-i32-range or
+        out-of-domain value is rejected outright rather than silently
+        wrapping (see _validate_sensor_value)."""
+        lidar = _validate_sensor_value(lidar, "lidar")
+        tof = _validate_sensor_value(tof, "tof")
+        slip = _validate_sensor_value(slip, "slip")
+
         evidence = HiramEvidence(lidar_obs=lidar, tof_obs=tof, wheel_slip_obs=slip)
         decision = HiramDecision()
 
@@ -179,7 +224,10 @@ def step_c_kernel(lidar: int, tof: int, slip: int) -> dict:
     HiramCKernel (and therefore a persistent hiram_workspace_t) -- see
     HiramCKernel.step() for the return contract. `lidar`/`tof`/`slip` are
     each in {HIRAM_UNOBSERVED (-1), 0, 1, 2} (2 == DROPOUT), matching
-    hiram_evidence_t's fields directly.
+    hiram_evidence_t's fields directly. Raises ValueError for anything
+    outside that domain (including a value only invalid because a
+    ctypes.c_int32 would silently wrap it, e.g. 2**32) -- see
+    HiramCKernel.step() / _validate_sensor_value.
     """
     return _get_default_kernel().step(lidar, tof, slip)
 
