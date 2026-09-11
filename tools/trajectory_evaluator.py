@@ -1,553 +1,336 @@
 """
-tools.trajectory_evaluator - Closed-loop integration & trajectory
-verification for the HIRAM safety kernel (Task 2.3, hardened per the Astra
-audit's HOLD findings on commit 140b8a03).
-
-Wires tools.inference_engine.BayesianInferenceEngine into a discrete-time
-control loop over sim.plant-compatible 1D cart kinematics: at each timestep,
-extract sensor evidence from the cart's exact physical state, call
-engine.step(evidence) to get a decision, apply that decision's control law
-to advance the cart's physics with exact analytical partial-step
-integration, and check for collision.
-
-Physics (exact analytical partial-step integration)
-----------------------------------------------------
-_advance_physics(x, v, a, dt) never lets a single fixed-dt step silently
-overshoot a physical boundary the way naive Euler integration with a
-post-hoc clamp would:
-
-  * Decelerating (a < 0) and v would cross zero within this step: the cart
-    comes to rest partway through the step, not at its end. The exact
-    time-to-stop and distance covered up to that instant are computed in
-    closed form (dt_stop = -v/a, dx = -v^2/(2a)), and velocity is reported
-    as exactly 0.0, not a small negative residual clamped away.
-  * Accelerating (a > 0) and v would exceed v_cruise within this step: the
-    cart accelerates only until it reaches v_cruise, then coasts at exactly
-    v_cruise for the remainder of the step (dt_acc = (v_cruise - v)/a, dx =
-    the accelerating segment's exact displacement plus v_cruise times the
-    remaining time).
-  * a == 0: trivial constant-velocity displacement.
-
-This is the same principle sim.plant.numerical_plant applies via bisection
-root-finding (Task 1.1) -- a fixed-step integrator must not be allowed to
-silently integrate across a kink in the dynamics -- specialized here to a
-closed form, since both kinks (v=0, v=v_cruise) have exact algebraic
-solutions for constant acceleration.
-
-Collision is a third such kink, and it gets the same treatment (hardened
-per audit review of commit 39ba0dd8, which found the original collision
-check compared the *end-of-step* position against obstacle_x after a full,
-obstacle-oblivious dt of integration -- so a step that stopped the cart
-exactly at its true kinematic limit past the obstacle reported the
-already-stopped v=0.0 as the "impact velocity", when the cart in fact
-passed the obstacle earlier in that same step at a strictly higher speed).
-_advance_physics_with_collision(x, v, a, dt, t, obstacle_x) checks whether
-the full-step (obstacle-oblivious) displacement would reach or exceed
-obstacle_x - x while v > 0; if so, it isolates the exact contact instant
-via Torricelli's equation (v_contact^2 = v^2 + 2*a*d) rather than reporting
-whatever _advance_physics's own v=0/v_cruise clamp produced for the full
-step.
-
-Evidence generation (deterministic continuous discretization)
-----------------------------------------------------------------
-extract_evidence() no longer samples noisily from the causal DAG's CPTs (the
-previous version of this module did, and that is intentionally discarded
-here): it deterministically discretizes the cart's actual physical state --
-distance-to-obstacle against a fixed detection range, and a physically-
-motivated wheel-slip-ratio proxy against a fixed slip threshold -- with no
-randomness at all. A sensor dropout window still forces the two range
-channels (LidarObs, TofObs) to report unobserved (None); by design (per
-this specification) WheelSlipObs is not affected by a range-sensor dropout,
-modeling it as a separate, independent telemetry channel (e.g. a wheel
-encoder / IMU) that a range-sensor link outage does not take down.
-
-sim.plant.PlantState is reused for initial conditions (integrating with
-tests/test_plant_oracle.py's data contract); tests/test_trajectory_
-verification.py separately cross-checks an emergency-braking episode's
-achieved stopping position against sim.plant.analytic_plant's independent
-closed-form solution. sim.scenarios.generator/StratumType supply realistic
-physical parameters (obstacle_position, braking_deceleration, dropout
-window) for NOMINAL/SHIFT test scenarios, integrating with Task 1.2's
-scenario models.
-
-Known simplification: ScenarioInstance has no dedicated "TrackCondition" or
-"DecelCapability" ground-truth field (Task 1.2's schema only carries the
-continuous braking_deceleration), so both labels used to drive
-compute_wheel_slip are derived from braking_deceleration via the same
-banding convention sim.scenarios.generator uses for its strata (NOMINAL
->= 0.4 m/s^2, DEGRADED [0.2, 0.4), CRITICAL < 0.2), with track condition
-correlated 1:1 to that band. A real deployment would have independent
-sensors/estimators for these; this evaluator does not attempt to invent an
-independent track-condition signal where the scenario schema has none.
-
-Zero external dependencies: standard library only (math, dataclasses,
-typing). No numpy/scipy/pgmpy, and (per this hardening pass) no `random`:
-evidence generation is now fully deterministic.
+HIRAM Safety Kernel - Task 2.3: Closed-Loop Trajectory Evaluator
+Simulates discrete-time 1D cart longitudinal kinematics, continuous-to-discrete sensor
+evidence extraction, and closed-loop control integration with BayesianInferenceEngine.
+Target: Pure Python 3 standard library reference simulation.
 """
 
+from __future__ import annotations
 import math
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from sim.plant import PlantState
-from sim.scenarios.strata import ScenarioInstance
-from tools.inference_engine import BayesianInferenceEngine, EvidenceValue
-
-# Braking-capability bands used to derive ground-truth DecelCapability (and,
-# by 1:1 correlation, TrackCondition) labels from a scenario's continuous
-# braking_deceleration, matching sim.scenarios.generator's strata banding
-# (NOMINAL bands >= 0.4 m/s^2, the LOW_BRAKING/DEGRADED band [0.2, 0.4), and
-# the degraded-brake shift strata below 0.2).
-_DECEL_NOMINAL_FLOOR = 0.4
-_DECEL_DEGRADED_FLOOR = 0.2
-_DECEL_LABELS = ("NOMINAL", "DEGRADED", "CRITICAL")
-_TRACK_LABELS = ("DRY", "WET", "ICY")
-
-# compute_wheel_slip's heuristic parameters (see its docstring): this
-# specification names the function and its 0.15 decision threshold, but not
-# its internal formula, so these constants are this module's own documented,
-# physically-motivated choice, not a value taken from elsewhere in the repo.
-_BASE_SLIP_BY_DECEL_CAPABILITY = {"NOMINAL": 0.05, "DEGRADED": 0.20, "CRITICAL": 0.45}
-_TRACK_SLIP_MULTIPLIER = {"DRY": 1.0, "WET": 1.3, "ICY": 1.8}
-_SLIP_REFERENCE_DECEL_MPS2 = 1.0  # normalizes "how hard are we braking" for the heuristic
+from tools.inference_engine import BayesianInferenceEngine
 
 
-def _true_decel_index(braking_deceleration: float) -> int:
-    """Ground-truth DecelCapability band index (0=NOMINAL, 1=DEGRADED,
-    2=CRITICAL) derived from a scenario's actual braking capability."""
-    if braking_deceleration >= _DECEL_NOMINAL_FLOOR:
-        return 0
-    if braking_deceleration >= _DECEL_DEGRADED_FLOOR:
-        return 1
-    return 2
-
-
-@dataclass(frozen=True)
-class TrajectoryProfile:
+def solve_step_kinematics_and_contact(
+    x0: float,
+    v0: float,
+    a_cmd: float,
+    dt: float,
+    v_cruise: float = 0.50,
+    obstacle_x: Optional[float] = None,
+) -> Tuple[float, float, bool, Optional[float], Optional[float]]:
     """
-    Per-episode control-loop parameters (as opposed to the physical
-    scenario parameters, which live on ScenarioInstance). Field names and
-    default values match this hardening pass's exact submitted
-    specification.
+    Simulates longitudinal point-mass kinematics over interval dt with cruise speed clamping
+    and exact intra-step contact detection against obstacle_x.
 
-    evidence_period_s decouples how often perception/decision runs
-    (engine.step()) from how often physics is integrated (dt): between
-    evidence updates, the last decision is held (zero-order hold), matching
-    how a real embedded control loop typically actuates faster than its
-    perception stack refreshes. None means "same as dt" (perception every
-    physics tick).
+    Returns:
+        (x_next, v_next, collision, contact_dt, contact_v)
     """
+    # 1. Kinematic trajectory segmentation over dt
+    if a_cmd < 0.0:
+        dt_stop = -v0 / a_cmd if a_cmd != 0 else float("inf")
+        if dt_stop <= dt:
+            dt1 = dt_stop
+            dx1 = - (v0 * v0) / (2.0 * a_cmd)
+            # Phase 2: cart brought to rest
+            x_next = x0 + dx1
+            v_next = 0.0
+        else:
+            dt1 = dt
+            dx1 = v0 * dt + 0.5 * a_cmd * dt * dt
+            x_next = x0 + dx1
+            v_next = v0 + a_cmd * dt
+        dx_total = x_next - x0
 
-    dt: float = 0.010  # s, physics integration period (10 ms)
-    evidence_period_s: Optional[float] = None  # s, perception/decision period; None = same as dt
-    max_duration_s: float = 20.0  # s, safety cutoff so a runaway loop can't hang a test
-    v_cruise: float = 0.50  # m/s, ACCEL's speed ceiling
-    a_drive: float = 0.25  # m/s^2, ACCEL's commanded (signed) acceleration
-    a_drag: float = -0.05  # m/s^2, COAST's commanded (signed) deceleration from rolling resistance
-    obstacle_appears_at_s: Optional[float] = 0.0  # s; None = obstacle never becomes real/detectable this episode
-    settle_steps: int = 15  # consecutive at-rest, non-ACCEL steps before ending the episode early
-    clearance_margin_m: float = 0.10  # matches the benchmark's standard clearance convention
-    detection_range_m: float = 0.300  # m, Lidar/ToF detection threshold
-    slip_threshold: float = 0.15  # wheel-slip-ratio threshold for HIGH(1)
+    elif a_cmd > 0.0:
+        if v0 >= v_cruise:
+            dt1 = 0.0
+            dx1 = 0.0
+            x_next = x0 + v_cruise * dt
+            v_next = v_cruise
+        else:
+            dt_cruise = (v_cruise - v0) / a_cmd
+            if dt_cruise <= dt:
+                dt1 = dt_cruise
+                dx1 = (v_cruise * v_cruise - v0 * v0) / (2.0 * a_cmd)
+                # Phase 2: cruising at v_cruise
+                dt2 = dt - dt1
+                dx2 = v_cruise * dt2
+                x_next = x0 + dx1 + dx2
+                v_next = v_cruise
+            else:
+                dt1 = dt
+                dx1 = v0 * dt + 0.5 * a_cmd * dt * dt
+                x_next = x0 + dx1
+                v_next = v0 + a_cmd * dt
+        dx_total = x_next - x0
+
+    else:
+        # a_cmd == 0.0 (pure coasting / constant velocity)
+        dt1 = dt
+        dx1 = v0 * dt
+        x_next = x0 + dx1
+        v_next = v0
+        dx_total = dx1
+
+    # 2. Contact resolution against obstacle_x
+    if obstacle_x is None or x0 >= obstacle_x:
+        return x_next, v_next, False, None, None
+
+    d = obstacle_x - x0
+    if d > dx_total:
+        # Step trajectory did not breach the obstacle boundary
+        return x_next, v_next, False, None, None
+
+    # Step breached obstacle: solve piecewise collision kinematics
+    if a_cmd < 0.0:
+        v_contact = math.sqrt(max(0.0, v0 * v0 + 2.0 * a_cmd * d))
+        contact_dt = (v_contact - v0) / a_cmd
+
+    elif a_cmd > 0.0:
+        if v0 >= v_cruise:
+            v_contact = v_cruise
+            contact_dt = d / v_cruise
+        elif d <= dx1:
+            v_contact = math.sqrt(v0 * v0 + 2.0 * a_cmd * d)
+            contact_dt = (v_contact - v0) / a_cmd
+        else:
+            v_contact = v_cruise
+            contact_dt = dt1 + (d - dx1) / v_cruise
+
+    else:
+        v_contact = v0
+        contact_dt = d / v0 if v0 > 0 else 0.0
+
+    return x_next, v_next, True, contact_dt, v_contact
 
 
-@dataclass(frozen=True)
-class TimestepRecord:
-    t: float
-    x: float
-    v: float
-    a: float
-    action: str
-    evidence: Dict[str, EvidenceValue]
-    fallback_active: bool
-    true_obstacle_blocked: bool
-
-
-@dataclass(frozen=True)
-class ContactEvent:
-    """The exact kinematics of first contact with an obstacle, isolated
-    within the timestep it occurred in (see _advance_physics_with_collision)."""
-
-    contact_time: float
-    contact_velocity: float
-    impact_energy: float
-
-
-@dataclass
-class EpisodeResult:
-    scenario: ScenarioInstance
-    profile: TrajectoryProfile
-    final_x: float
-    final_v: float
-    duration_s: float
-    steps: int
-    collision: bool
-    settled: bool  # True if the cart came to rest and stayed there (vs. hit max_duration_s / collision)
-    clearance_m: Optional[float]  # obstacle_position - final_x, or None if there's no obstacle
-    contact_time: Optional[float] = None  # exact time of first contact, isolated within its timestep
-    contact_velocity: Optional[float] = None  # exact velocity at first contact (Torricelli), not a post-clamp value
-    impact_energy: Optional[float] = None  # 0.5 * mass * contact_velocity^2
-    action_history: List[str] = field(default_factory=list)
-    action_change_count: int = 0
-    emergency_brake_engaged: bool = False
-    first_emergency_brake_t: Optional[float] = None
-    false_emergency_stop_count: int = 0
-    fallback_event_count: int = 0
-    records: List[TimestepRecord] = field(default_factory=list)
+class TrajectoryResult:
+    def __init__(
+        self,
+        time_history: List[float],
+        x_history: List[float],
+        v_history: List[float],
+        a_history: List[float],
+        action_history: List[str],
+        collision: bool,
+        contact_time: Optional[float],
+        contact_velocity: Optional[float],
+        impact_energy: Optional[float],
+        final_x: float,
+        final_v: float,
+        total_time: float,
+    ) -> None:
+        self.time_history = time_history
+        self.x_history = x_history
+        self.v_history = v_history
+        self.a_history = a_history
+        self.action_history = action_history
+        self.collision = collision
+        self.contact_time = contact_time
+        self.contact_velocity = contact_velocity
+        self.impact_energy = impact_energy
+        self.final_x = final_x
+        self.final_v = final_v
+        self.total_time = total_time
 
 
 class TrajectoryEvaluator:
-    """
-    Drives a closed-loop rollout: extract evidence from exact physical
-    state -> engine.step(evidence) -> apply the selected action's control
-    law -> advance physics exactly -> check collision -> repeat. One
-    evaluator is built around one fixed (engine, scenario) pair;
-    run_episode() may be called multiple times (e.g. with different initial
-    states/profiles) against that same pair.
-    """
-
-    def __init__(self, engine: BayesianInferenceEngine, scenario: ScenarioInstance, mass: float = 1.0) -> None:
+    def __init__(
+        self,
+        engine: BayesianInferenceEngine,
+        dt: float = 0.010,
+        v_cruise: float = 0.50,
+        a_drive: float = +0.25,
+        a_drag: float = -0.05,
+        detection_threshold: float = 0.300,
+        slip_threshold: float = 0.15,
+        cart_mass: float = 5.0,
+    ) -> None:
         self.engine = engine
-        self.scenario = scenario
-        self.v_cruise = 0.50  # overwritten by run_episode() from the active profile; usable standalone too
-        self._current_a = 0.0  # acceleration currently being applied, as read by extract_evidence()
-        # This benchmark otherwise carries no cart-mass concept anywhere
-        # (sim.plant/sim.scenarios are purely kinematic); 1.0 kg is a
-        # normalized default for impact_energy = 0.5*mass*v^2, not a value
-        # taken from elsewhere in the repo.
-        self.mass = mass
+        self.dt = dt
+        self.v_cruise = v_cruise
+        self.a_drive = a_drive
+        self.a_drag = a_drag
+        self.detection_threshold = detection_threshold
+        self.slip_threshold = slip_threshold
+        self.cart_mass = cart_mass
 
-    # ------------------------------------------------------------------
-    # Ground truth
-    # ------------------------------------------------------------------
-    def _ground_truth_labels(self) -> Tuple[str, str]:
-        """(track_condition, decel_capability) labels derived from the
-        scenario's actual braking capability -- see module docstring."""
-        idx = _true_decel_index(self.scenario.braking_deceleration)
-        return _TRACK_LABELS[idx], _DECEL_LABELS[idx]
+        # Base nominal deceleration capability by surface condition
+        self.brake_decel_table = {
+            "DRY": 1.20,
+            "WET": 0.80,
+            "ICY": 0.35,
+        }
 
-    def _obstacle_detectable(self, t: float, profile: TrajectoryProfile) -> bool:
-        if self.scenario.obstacle_position is None:
-            return False
-        if profile.obstacle_appears_at_s is None:
-            return False
-        return t >= profile.obstacle_appears_at_s
+    def _get_braking_deceleration(
+        self, track_condition: str, decel_capability: str, override_brake_decel: Optional[float] = None
+    ) -> float:
+        if override_brake_decel is not None:
+            return override_brake_decel
 
-    def _dropout_window(self) -> Optional[Tuple[float, float]]:
-        if self.scenario.dropout_duration_s <= 0.0:
-            return None
-        return (self.scenario.dropout_start_s, self.scenario.dropout_start_s + self.scenario.dropout_duration_s)
-
-    # ------------------------------------------------------------------
-    # Evidence generation (deterministic continuous discretization)
-    # ------------------------------------------------------------------
-    def compute_wheel_slip(self, v: float, a: float, track_condition: str, decel_capability: str) -> float:
-        """
-        A physically-motivated proxy for a wheel-slip-ratio sensor: slip
-        increases with how hard the cart is decelerating and with how poor
-        its actual traction is (worse decel_capability, worse
-        track_condition). Not braking (a >= 0) or already stationary
-        (v <= 0) implies no slip. This heuristic's exact shape is this
-        module's own documented choice (see module docstring); only its
-        0.15 decision threshold and its (v, a, track_condition,
-        decel_capability) inputs are part of the specification.
-        """
-        if a >= 0.0 or v <= 0.0:
-            return 0.0
-        base = _BASE_SLIP_BY_DECEL_CAPABILITY.get(decel_capability, _BASE_SLIP_BY_DECEL_CAPABILITY["NOMINAL"])
-        track_mult = _TRACK_SLIP_MULTIPLIER.get(track_condition, 1.0)
-        intensity = min(1.0, abs(a) / _SLIP_REFERENCE_DECEL_MPS2)
-        return base * track_mult * (0.5 + 0.5 * intensity)
+        base = self.brake_decel_table.get(track_condition, 1.20)
+        if decel_capability == "NOMINAL":
+            return base
+        elif decel_capability == "DEGRADED":
+            return 0.60 * base
+        elif decel_capability == "CRITICAL":
+            return 0.20 * base
+        return base
 
     def extract_evidence(
         self,
         x: float,
         v: float,
+        a_current: float,
         obstacle_x: Optional[float],
         track_condition: str,
         decel_capability: str,
         t: float,
-        dropout_window: Optional[Tuple[float, float]],
-        detection_range_m: float = 0.300,
-        slip_threshold: float = 0.15,
-    ) -> Dict[str, EvidenceValue]:
+        dropout_window: Optional[Tuple[float, float]] = None,
+        force_slip_high: bool = False,
+    ) -> Dict[str, Optional[int]]:
         """
-        Deterministically discretize the cart's exact physical state into
-        tri-state evidence -- no random sampling. `obstacle_x` is None when
-        there is no obstacle, or it exists but has not yet become
-        detectable this episode (see TrajectoryProfile.obstacle_appears_at_s
-        for the pop-up-obstacle mechanism).
-
-        The acceleration used for the wheel-slip computation is read from
-        self._current_a (the acceleration the cart is *currently* being
-        subjected to, from the previous control decision) rather than a
-        function parameter: perception measures the cart's present
-        dynamics before a new decision changes them.
+        Transforms continuous plant states into discrete Bayesian evidence literals.
+        Range sensor blackout windows yield None for range sensors.
         """
-        d_clear = obstacle_x - x if obstacle_x is not None else float("inf")
+        in_range_dropout = (
+            dropout_window is not None
+            and (dropout_window[0] <= t <= dropout_window[1])
+        )
 
-        if dropout_window is not None and dropout_window[0] <= t <= dropout_window[1]:
-            lidar_obs: EvidenceValue = None
-            tof_obs: EvidenceValue = None
+        if in_range_dropout:
+            lidar_obs = None
+            tof_obs = None
         else:
-            lidar_obs = 1 if d_clear <= detection_range_m else 0
-            tof_obs = 1 if d_clear <= detection_range_m else 0
+            if obstacle_x is not None:
+                clearance = obstacle_x - x
+                is_detected = 1 if clearance <= self.detection_threshold else 0
+            else:
+                is_detected = 0
+            lidar_obs = is_detected
+            tof_obs = is_detected
 
-        slip_ratio = self.compute_wheel_slip(v, self._current_a, track_condition, decel_capability)
-        wheel_slip_obs: EvidenceValue = 1 if slip_ratio >= slip_threshold else 0
+        if force_slip_high:
+            wheel_slip_obs = 1
+        else:
+            if a_current < 0 and (track_condition in ("WET", "ICY") or decel_capability != "NOMINAL"):
+                slip_ratio = 0.25
+            else:
+                slip_ratio = 0.02
+            wheel_slip_obs = 1 if slip_ratio >= self.slip_threshold else 0
 
-        return {"LidarObs": lidar_obs, "TofObs": tof_obs, "WheelSlipObs": wheel_slip_obs}
+        return {
+            "LidarObs": lidar_obs,
+            "TofObs": tof_obs,
+            "WheelSlipObs": wheel_slip_obs,
+        }
 
-    # ------------------------------------------------------------------
-    # Control law
-    # ------------------------------------------------------------------
-    def _commanded_acceleration(self, action: str, profile: TrajectoryProfile) -> float:
-        """
-        The constant (signed) acceleration commanded for `action`. No
-        v-dependent branching is needed here: _advance_physics's exact
-        partial-step integration is what enforces v_cruise / v=0 boundaries,
-        so the same constant command is correct whether or not this step
-        actually reaches one.
-        """
-        if action == "ACCEL":
-            return profile.a_drive
-        if action == "COAST":
-            return profile.a_drag
-        if action == "EMERGENCY_BRAKE":
-            return -self.scenario.braking_deceleration
-        raise ValueError(f"unknown action {action!r}")
-
-    def _advance_physics(self, x: float, v: float, a: float, dt: float) -> Tuple[float, float]:
-        """
-        Exact analytical partial-step integration: neither a deceleration
-        past v=0 nor an acceleration past v_cruise is allowed to silently
-        overshoot within a single dt -- see module docstring.
-        """
-        if a < 0.0:
-            if v + a * dt <= 0.0:
-                # Cart comes to rest partway through this step.
-                dt_stop = -v / a  # unused beyond documenting the exact crossing time
-                dx = -(v * v) / (2.0 * a)
-                return x + dx, 0.0
-            dx = v * dt + 0.5 * a * dt * dt
-            return x + dx, v + a * dt
-
-        if a > 0.0:
-            if v + a * dt > self.v_cruise:
-                # Cart reaches v_cruise partway through this step, then
-                # coasts at exactly v_cruise for the remainder.
-                dt_acc = (self.v_cruise - v) / a
-                dx = ((self.v_cruise * self.v_cruise) - (v * v)) / (2.0 * a) + self.v_cruise * (dt - dt_acc)
-                return x + dx, self.v_cruise
-            dx = v * dt + 0.5 * a * dt * dt
-            return x + dx, v + a * dt
-
-        return x + v * dt, v
-
-    def _advance_physics_with_collision(
-        self, x: float, v: float, a: float, dt: float, t: float, obstacle_x: Optional[float]
-    ) -> Tuple[float, float, Optional[ContactEvent]]:
-        """
-        Wraps _advance_physics with intra-step collision resolution: if the
-        obstacle-oblivious full-step displacement would reach or exceed the
-        remaining distance to `obstacle_x` while v > 0, the exact contact
-        instant is isolated via Torricelli's equation rather than reporting
-        _advance_physics's own (obstacle-oblivious) end-of-step state.
-
-        Returns (x_next, v_next, contact_event_or_None). On contact,
-        x_next == obstacle_x and v_next == the exact contact velocity (not
-        whatever _advance_physics's v=0/v_cruise clamp would have produced
-        for the full, uninterrupted step).
-        """
-        if obstacle_x is not None and v > 0.0:
-            remaining = obstacle_x - x
-            if remaining <= 0.0:
-                # Already at/past the obstacle -- defensive: run_episode is
-                # expected to have already ended the episode before this can
-                # happen, since it checks for contact every step.
-                contact = ContactEvent(
-                    contact_time=t,
-                    contact_velocity=v,
-                    impact_energy=0.5 * self.mass * v * v,
-                )
-                return x, v, contact
-
-            x_full, v_full = self._advance_physics(x, v, a, dt)
-            if (x_full - x) >= remaining:
-                v_contact = math.sqrt(max(0.0, v * v + 2.0 * a * remaining))
-                dt_contact = (remaining / v) if abs(a) < 1e-12 else ((v_contact - v) / a)
-                contact = ContactEvent(
-                    contact_time=t + dt_contact,
-                    contact_velocity=v_contact,
-                    impact_energy=0.5 * self.mass * v_contact * v_contact,
-                )
-                return obstacle_x, v_contact, contact
-            return x_full, v_full, None
-
-        x_full, v_full = self._advance_physics(x, v, a, dt)
-        return x_full, v_full, None
-
-    # ------------------------------------------------------------------
-    # Episode rollout
-    # ------------------------------------------------------------------
     def run_episode(
         self,
-        initial_state: PlantState,
-        trajectory_profile: TrajectoryProfile,
-        evidence_override: Optional[Callable[[float], Dict[str, EvidenceValue]]] = None,
-    ) -> EpisodeResult:
+        initial_x: float = 0.0,
+        initial_v: float = 0.0,
+        max_duration: float = 5.0,
+        obstacle_x: Optional[float] = None,
+        track_condition: str = "DRY",
+        decel_capability: str = "NOMINAL",
+        dropout_window: Optional[Tuple[float, float]] = None,
+        override_brake_decel: Optional[float] = None,
+        force_slip_high: bool = False,
+    ) -> TrajectoryResult:
         """
-        Roll out one closed-loop episode from `initial_state` under
-        `trajectory_profile`.
-
-        `evidence_override`, if given, replaces extract_evidence() with a
-        caller-supplied function of the current time -- used by tests to
-        inject specific/corrupted evidence sequences (e.g. to force the
-        zero-likelihood fallback) without needing a coincidentally
-        self-inconsistent CPT.
+        Executes a closed-loop discrete-time simulation episode.
         """
-        profile = trajectory_profile
-        self.v_cruise = profile.v_cruise
-        evidence_period = profile.evidence_period_s if profile.evidence_period_s is not None else profile.dt
-
-        x, v = initial_state.position, initial_state.velocity
         t = 0.0
+        x = initial_x
+        v = initial_v
+        a = 0.0
 
-        track_condition, decel_capability = self._ground_truth_labels()
-        dropout_window = self._dropout_window()
+        t_hist: List[float] = [t]
+        x_hist: List[float] = [x]
+        v_hist: List[float] = [v]
+        a_hist: List[float] = [a]
+        action_hist: List[str] = []
 
-        records: List[TimestepRecord] = []
-        action_history: List[str] = []
-        false_emergency_stop_count = 0
-        fallback_event_count = 0
-        emergency_brake_engaged = False
-        first_emergency_brake_t: Optional[float] = None
         collision = False
         contact_time: Optional[float] = None
         contact_velocity: Optional[float] = None
         impact_energy: Optional[float] = None
-        settled = False
-        consecutive_settled_steps = 0
-        has_moved = False
 
-        # Zero-order hold: the decision (and the evidence that produced it)
-        # only updates at evidence_period boundaries; physics integrates
-        # every dt in between using whatever decision is currently held.
-        # A decision's bookkeeping (false-alarm/fallback counts, history) is
-        # attributed once, at the moment it is *made*, not once per physics
-        # tick it happens to be held over.
-        current_evidence: Dict[str, EvidenceValue] = {}
-        current_action = "COAST"  # safe default before the first perception update
-        current_fallback = False
-        self._current_a = 0.0
-        next_evidence_t = 0.0
-
-        n_steps = max(1, math.ceil(profile.max_duration_s / profile.dt))
-        for _ in range(n_steps):
-            if t >= next_evidence_t - 1e-9:
-                # The obstacle used for *evidence* is gated by detectability
-                # (the pop-up-obstacle mechanism); the *physical* obstacle
-                # used for collision resolution below is not -- a cart can
-                # be struck by an obstacle it hasn't sensed yet, which is
-                # exactly the pop-up-obstacle danger this evaluator models.
-                sensed_obstacle_x = self.scenario.obstacle_position if self._obstacle_detectable(t, profile) else None
-                if evidence_override is not None:
-                    current_evidence = evidence_override(t)
-                else:
-                    current_evidence = self.extract_evidence(
-                        x,
-                        v,
-                        sensed_obstacle_x,
-                        track_condition,
-                        decel_capability,
-                        t,
-                        dropout_window,
-                        detection_range_m=profile.detection_range_m,
-                        slip_threshold=profile.slip_threshold,
-                    )
-                result = self.engine.step(current_evidence)
-                current_action = result["selected_action"]
-                current_fallback = result["fallback_active"]
-                next_evidence_t += evidence_period
-
-                true_blocked = self._obstacle_detectable(t, profile)
-                if current_action == "EMERGENCY_BRAKE":
-                    if not emergency_brake_engaged:
-                        emergency_brake_engaged = True
-                        first_emergency_brake_t = t
-                    if not true_blocked:
-                        false_emergency_stop_count += 1
-                if current_fallback:
-                    fallback_event_count += 1
-                action_history.append(current_action)
-
-                self._current_a = self._commanded_acceleration(current_action, profile)
-
-            a_cmd = self._current_a
-            x, v, contact = self._advance_physics_with_collision(
-                x, v, a_cmd, profile.dt, t, self.scenario.obstacle_position
-            )
-            t_next = contact.contact_time if contact is not None else t + profile.dt
-
-            records.append(
-                TimestepRecord(
-                    t=t_next,
-                    x=x,
-                    v=v,
-                    a=a_cmd,
-                    action=current_action,
-                    evidence=current_evidence,
-                    fallback_active=current_fallback,
-                    true_obstacle_blocked=self._obstacle_detectable(t_next, profile),
-                )
-            )
-            t = t_next
-
-            if contact is not None:
-                if not collision:  # record only the first contact
-                    collision = True
-                    contact_time = contact.contact_time
-                    contact_velocity = contact.contact_velocity
-                    impact_energy = contact.impact_energy
-                break
-
-            if v > 0.0:
-                has_moved = True
-
-            if has_moved and v <= 0.0 and current_action != "ACCEL":
-                consecutive_settled_steps += 1
-                if consecutive_settled_steps >= profile.settle_steps:
-                    settled = True
-                    break
-            else:
-                consecutive_settled_steps = 0
-
-        action_change_count = sum(
-            1 for prev, cur in zip(action_history, action_history[1:]) if prev != cur
+        a_brake_mag = self._get_braking_deceleration(
+            track_condition, decel_capability, override_brake_decel
         )
 
-        clearance_m = None
-        if self.scenario.obstacle_position is not None:
-            clearance_m = self.scenario.obstacle_position - x
+        steps = int(math.ceil(max_duration / self.dt))
+        for _ in range(steps):
+            # 1. Sample continuous evidence
+            evidence = self.extract_evidence(
+                x, v, a, obstacle_x, track_condition, decel_capability, t, dropout_window, force_slip_high
+            )
 
-        return EpisodeResult(
-            scenario=self.scenario,
-            profile=profile,
-            final_x=x,
-            final_v=v,
-            duration_s=t,
-            steps=len(records),
+            # 2. Kernel decision execution
+            step_out = self.engine.step(evidence)
+            action = (
+                step_out.get("selected_action")
+                or step_out.get("best_action_name")
+                or step_out.get("action")
+                or step_out.get("best_action")
+            )
+            action_hist.append(action)
+
+            # 3. Command acceleration translation
+            if action == "ACCEL":
+                a_cmd = self.a_drive
+            elif action == "COAST":
+                a_cmd = self.a_drag
+            elif action == "EMERGENCY_BRAKE":
+                a_cmd = -a_brake_mag
+            else:
+                a_cmd = -a_brake_mag
+
+            # 4. Advance kinematics and check for obstacle collision
+            x_next, v_next, step_coll, c_dt, c_v = solve_step_kinematics_and_contact(
+                x0=x,
+                v0=v,
+                a_cmd=a_cmd,
+                dt=self.dt,
+                v_cruise=self.v_cruise,
+                obstacle_x=obstacle_x,
+            )
+
+            if step_coll and not collision:
+                collision = True
+                contact_time = t + c_dt
+                contact_velocity = c_v
+                impact_energy = 0.5 * self.cart_mass * (c_v * c_v)
+
+            # State update
+            t += self.dt
+            x = x_next
+            v = v_next
+            a = a_cmd
+
+            t_hist.append(t)
+            x_hist.append(x)
+            v_hist.append(v)
+            a_hist.append(a)
+
+            # Terminate when brought to rest after motion has occurred
+            if v <= 0.0 and a_cmd < 0 and (x > 1e-5 or t > 0.05):
+                break
+
+        return TrajectoryResult(
+            time_history=t_hist,
+            x_history=x_hist,
+            v_history=v_hist,
+            a_history=a_hist,
+            action_history=action_hist,
             collision=collision,
-            settled=settled,
-            clearance_m=clearance_m,
             contact_time=contact_time,
             contact_velocity=contact_velocity,
             impact_energy=impact_energy,
-            action_history=action_history,
-            action_change_count=action_change_count,
-            emergency_brake_engaged=emergency_brake_engaged,
-            first_emergency_brake_t=first_emergency_brake_t,
-            false_emergency_stop_count=false_emergency_stop_count,
-            fallback_event_count=fallback_event_count,
-            records=records,
+            final_x=x,
+            final_v=v,
+            total_time=t,
         )
