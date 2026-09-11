@@ -5,9 +5,10 @@ Scaffolding for the audit paperwork step of the Task 3.1/3.2 workflow:
 gathers the state an Astra sign-off needs a fresh look at on every
 submission (current commit, the kernel's static DTCM footprint, the
 pre-audit gatekeeper's verdict, the C/Python parity test's verdict --
-including the integer-overflow regression -- the 4-way comparative
-benchmark, and the wheel-slip ablation study) and writes them as a single
-Markdown file, so there is nothing to hand-transcribe before a submission.
+including the integer-overflow regression -- the 5-way comparative
+benchmark, and the wheel-slip ablation study/causal chronology) and writes
+them as a single Markdown file, so there is nothing to hand-transcribe
+before a submission.
 
 This script does not itself decide whether a commit is submittable -- that
 is tools/pre_audit_verifier.py's job (also invoked here, as one of the
@@ -83,7 +84,7 @@ def run_c_binding_parity_test() -> tuple[bool, str]:
 
 
 def run_comparative_benchmark() -> tuple[bool, str, dict | None]:
-    """Runs tools/run_comparative_benchmark.py (the 4-way controller
+    """Runs tools/run_comparative_benchmark.py (the 5-way controller
     benchmark + wheel-slip ablation study), which as a side effect writes
     build/benchmark_results.json / build/benchmark_results.md. Returns
     (success, captured stdout+stderr, parsed JSON results or None)."""
@@ -108,6 +109,24 @@ def _tail(text: str, n_lines: int = 25) -> str:
     return "\n".join(lines[-n_lines:])
 
 
+def _render_controller_matrix(benchmark_json: dict | None) -> str:
+    """Renders the 5-controller comparison table directly from
+    build/benchmark_results.json's `controllers[*].results` -- every number
+    is read out of that file, never hardcoded here, so this table can never
+    silently drift from what the benchmark actually produced."""
+    if benchmark_json is None or "controllers" not in benchmark_json:
+        return "UNAVAILABLE -- build/benchmark_results.json missing or malformed; see section 5's raw output."
+
+    lines = [
+        "| Controller | Collisions | False Halts | Total Progress (m) |",
+        "|---|---|---|---|",
+    ]
+    for name, ctrl in benchmark_json["controllers"].items():
+        r = ctrl["results"]
+        lines.append(f"| {name} | {r['collisions']} | {r['nuisance_stops']} | {r['total_progress_m']:.3f} |")
+    return "\n".join(lines)
+
+
 def _render_ablation_section(benchmark_json: dict | None) -> str:
     if benchmark_json is None or "wheel_slip_ablation" not in benchmark_json:
         return "UNAVAILABLE -- build/benchmark_results.json missing or malformed; see section 5's raw output."
@@ -115,6 +134,16 @@ def _render_ablation_section(benchmark_json: dict | None) -> str:
     ablation = benchmark_json["wheel_slip_ablation"]
     baseline = ablation["baseline"]
     ablated = ablation["ablated"]
+
+    chronology_lines = [
+        "| t (s) | Baseline action | Ablated action | Event |",
+        "|---|---|---|---|",
+    ]
+    for evt in ablation.get("chronology", []):
+        chronology_lines.append(
+            f"| {evt['t']:.4f} | {evt['baseline_action']} | {evt['ablated_action']} | {evt['event']} |"
+        )
+
     return f"""Scenario: **{ablation['scenario']}**
 
 | | Baseline (WheelSlipObs observed) | Ablated (WheelSlipObs forced unobserved) |
@@ -122,15 +151,30 @@ def _render_ablation_section(benchmark_json: dict | None) -> str:
 | Collision | {baseline['collision']} | {ablated['collision']} |
 | Contact time (s) | {baseline['contact_time']} | {ablated['contact_time']} |
 | Contact velocity (m/s) | {baseline['contact_velocity']} | {ablated['contact_velocity']} |
-| First brake/coast step | {baseline['first_brake_or_coast_step']} | {ablated['first_brake_or_coast_step']} |
+| Final x / clearance (m) | {baseline.get('final_x')} / {baseline.get('clearance_m')} | -- (collided) |
+| First EMERGENCY_BRAKE step | {baseline['first_emergency_brake_step']} | {ablated['first_emergency_brake_step']} |
 
 **Finding:** {ablation['finding']}
 
 This isolates whether wheel-slip inference is *causally* load-bearing for
 collision avoidance in this scenario (as opposed to merely correlated with
-a safe outcome), by re-running the identical episode with WheelSlipObs
-forced to HIRAM_UNOBSERVED on every step and comparing outcomes directly --
-see `tools/run_comparative_benchmark.py:run_wheel_slip_ablation`."""
+a safe outcome). HIRAM (Bayesian C) and HIRAM (Ablated: No Wheel-Slip) are
+run as two full controllers across all 5 scenarios in the matrix above
+(section 5); this section reuses their already-computed Scenario 5 traces
+directly (bit-exact with that table, nothing is re-simulated separately) --
+see `tools/run_comparative_benchmark.py:run_wheel_slip_ablation`.
+
+### Causal chronology (Scenario 5)
+
+{chr(10).join(chronology_lines)}
+
+Sensor model scope: wheel slip in the current simulation
+(`tools/trajectory_evaluator.py:TrajectoryEvaluator.extract_evidence`) is
+triggered purely as a function of commanded deceleration on a WET/ICY track
+or under non-NOMINAL decel capability -- it is not an independent random
+fault. WheelSlipObs is therefore only informative once the plant is
+actually decelerating; it carries no signal during Scenario 5's initial
+COAST phase."""
 
 
 def render_dossier(
@@ -154,6 +198,7 @@ def render_dossier(
         else "NOT READY -- DO NOT SUBMIT"
     )
 
+    controller_matrix = _render_controller_matrix(benchmark_json)
     ablation_section = _render_ablation_section(benchmark_json)
 
     return f"""# HIRAM Safety Kernel -- Astra Audit Dossier
@@ -238,15 +283,31 @@ above.
 
 ## 5. Comparative benchmark & wheel-slip ablation (`tools/run_comparative_benchmark.py`): {benchmark_status}
 
-4-way controller comparison (HIRAM Bayesian C kernel vs. Naive Threshold vs.
-Conservative Kinematic vs. Always-Brake) across 5 operational regimes, plus
-the wheel-slip ablation study (section 5a). Full reproducible results and
-per-step traces: `build/benchmark_results.json`; human-readable table:
-`build/benchmark_results.md`.
+5-way controller comparison across 5 operational regimes: HIRAM (Bayesian
+C), HIRAM (Ablated: No Wheel-Slip) -- run as a full controller across all 5
+scenarios, not only Scenario 5 -- Naive Threshold, Conservative Rule-Based
+(a fixed discrete-evidence rule table; it does not compute a continuous
+kinematic stopping distance, hence the name), and Always-Brake. Full
+reproducible results and per-step traces: `build/benchmark_results.json`;
+human-readable table: `build/benchmark_results.md`.
+
+{controller_matrix}
+
+Every latency measurement's timed span covers the same unit of work for
+every controller -- entry to fully-constructed return dict (`step()`'s
+full evidence-to-decision path), not just the "decision logic" portion --
+see `HiramCKernelEngine.step()` / `WheelSlipAblatedHiramEngine.step()` /
+`NaiveThresholdEngine.step()` / `ConservativeRuleBasedEngine.step()` /
+`AlwaysBrakeEngine.step()`. Deterministic trajectory results (episodes,
+collisions, contact time/velocity, progress, scenario traces) are kept in
+a `results` sub-object separate from the non-deterministic `timing`
+sub-object in `build/benchmark_results.json`, so `results` reproduces
+bit-exactly across runs while `timing` is free to vary with host
+scheduling jitter.
 
 **Timing methodology note:** every latency figure in this section (and in
-`build/benchmark_results.json`/`.md`) is an *observed host execution time* --
-`time.perf_counter()` wall-clock around each controller's `step()` call, on
+`build/benchmark_results.json`'s `timing` sub-objects / `.md`) is an
+*observed host execution time* -- `time.perf_counter()` wall-clock, on
 whatever development machine ran this script. These are **not** a hard
 worst-case-execution-time (WCET) bound for the on-target Cortex-M7 kernel;
 WCET analysis for the embedded target is out of scope for this host-side
@@ -256,12 +317,12 @@ comparative benchmark.
 <summary>Full output</summary>
 
 ```
-{_tail(benchmark_output, 60)}
+{_tail(benchmark_output, 80)}
 ```
 
 </details>
 
-### 5a. Wheel-slip ablation findings
+### 5a. Wheel-slip ablation findings and causal chronology
 
 {ablation_section}
 """
@@ -282,7 +343,7 @@ def main() -> None:
     parity_passed, parity_output = run_c_binding_parity_test()
     print(f"[dossier]   -> {'PASS' if parity_passed else 'FAIL'}")
 
-    print("[dossier] Running tools/run_comparative_benchmark.py (4-way benchmark + wheel-slip ablation)...")
+    print("[dossier] Running tools/run_comparative_benchmark.py (5-way benchmark + wheel-slip ablation)...")
     benchmark_passed, benchmark_output, benchmark_json = run_comparative_benchmark()
     print(f"[dossier]   -> {'PASS' if benchmark_passed else 'FAIL'}")
 
