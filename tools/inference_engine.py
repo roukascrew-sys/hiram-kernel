@@ -40,6 +40,32 @@ no data-dependent control flow beyond which evidence values were supplied.
 Tri-state evidence: each sensor's evidence value is an int in {0, 1, 2}
 (matching that sensor's 3 declared states, index 2 always being "DROPOUT"
 per Task 2.1's tri-state invariant) or None for "not observed this step".
+
+Dropout ("2") vs unobserved ("None") contract: by design, a reported
+DROPOUT reading carries no information about the sensor's parent -- it
+means the telemetry link produced nothing usable, not "the parent is in
+some particular state." So DROPOUT and "not observed" are semantically the
+same event, and BayesianInferenceEngine treats them identically by default
+(marginalize_dropout_state=True): both marginalize the sensor out
+analytically (likelihood factor 1.0 for every parent state), not just an
+unobserved key. This is exact, not an approximation, because a CPT's row
+already sums to 1.0: summing a sensor's likelihood over all 3 of its states
+(including DROPOUT) is mathematically identical to never having asked the
+CPT at all. Pass marginalize_dropout_state=False to instead treat an
+observed DROPOUT value as ordinary evidence (i.e. condition on "the sensor
+reported dropout", using its DROPOUT-row CPT entries, which is a different
+and non-trivial computation from marginalizing it out).
+
+Python Reference Engine: this module is the algorithmic reference
+implementation of the inference/decision logic, prioritizing clarity and
+direct correspondence to the mathematical definitions above. Its "zero
+dynamic memory allocation" and "static row-major array" properties describe
+the *shape* of the computation (fixed-size lookups and loops driven by the
+model's precomputed strides, no data-dependent recursion or growth) -- they
+are not a literal guarantee about the CPython interpreter, which allocates
+objects for lists/tuples/floats as a matter of course. The actual
+zero-allocation guarantee is a target for the downstream C implementation
+(Phase 3), which this module's arithmetic is designed to port to directly.
 """
 
 import hashlib
@@ -96,7 +122,21 @@ class BayesianInferenceEngine:
     #: value is not the certified model this engine was built against.
     EXPECTED_IR_DIGEST = "b39845824f903e9230c75110ffd822ccea36cd89a5ebb4eae1235ff4860b57e7"
 
-    def __init__(self, model_path: str = "data/models/causal_dag.json") -> None:
+    def __init__(
+        self,
+        model_path: str = "data/models/causal_dag.json",
+        marginalize_dropout_state: bool = True,
+    ) -> None:
+        """
+        marginalize_dropout_state: when True (the default -- see the module
+        docstring's "Dropout vs unobserved" section), an evidence value
+        equal to a sensor's DROPOUT state index is treated identically to
+        that sensor being unobserved (None): marginalized out analytically.
+        When False, an observed DROPOUT value is instead used as ordinary
+        evidence (conditioning on "the sensor reported dropout").
+        """
+        self.marginalize_dropout_state = marginalize_dropout_state
+
         path = Path(model_path)
         try:
             model = json.loads(path.read_text(encoding="utf-8"))
@@ -137,6 +177,9 @@ class BayesianInferenceEngine:
         self._obstacle_cpt: List[float] = self._nodes[_OBSTACLE_NODE]["cpt"]
         self._decel_cpt: List[float] = self._nodes[_DECEL_NODE]["cpt"]
         self._sensor_cpt: Dict[str, List[float]] = {s: self._nodes[s]["cpt"] for s in _SENSOR_NODES}
+        self._dropout_state_index: Dict[str, Optional[int]] = {
+            s: self._nodes[s].get("dropout_state_index") for s in _SENSOR_NODES
+        }
 
         self._track_to_obstacle_stride = self._nodes[_OBSTACLE_NODE]["parent_strides"][_TRACK_NODE]
         self._track_to_decel_stride = self._nodes[_DECEL_NODE]["parent_strides"][_TRACK_NODE]
@@ -147,6 +190,25 @@ class BayesianInferenceEngine:
         self._actions: List[str] = self._loss["actions"]
         self._loss_values: List[float] = self._loss["matrix"]
         self._loss_action_stride: int = self._loss["action_stride"]
+
+        if "EMERGENCY_BRAKE" not in self._actions:
+            raise ValueError(
+                f"model's loss matrix has no 'EMERGENCY_BRAKE' action ({self._actions!r}); "
+                "this engine's safety fallbacks require it to exist"
+            )
+        self._emergency_brake_index = self._actions.index("EMERGENCY_BRAKE")
+
+        # The true physical prior P(TrueObstacle, DecelCapability), computed
+        # once with no evidence at all (TrackCondition marginalized, no
+        # sensor factors applied). Used as the conservative fallback
+        # distribution when evidence is contradictory/degenerate (see
+        # _compute_posterior_with_diagnostics) instead of an arbitrary
+        # uniform guess. Safe to compute via the normal inference path here:
+        # with empty evidence the likelihood is always comfortably nonzero
+        # for a well-formed model (every CPT row sums to 1.0), so this call
+        # can never itself hit the fallback branch that would reference
+        # self._prior_marginal before it exists.
+        self._prior_marginal, _ = self._compute_posterior_with_diagnostics({})
 
     # ------------------------------------------------------------------
     # Evidence validation
@@ -160,6 +222,16 @@ class BayesianInferenceEngine:
         n_states = len(self._nodes[sensor_name]["states"])
         if not 0 <= value < n_states:
             raise ValueError(f"evidence for '{sensor_name}' = {value} out of range [0, {n_states})")
+
+        if self.marginalize_dropout_state:
+            dropout_idx = self._dropout_state_index.get(sensor_name)
+            if dropout_idx is not None and value == dropout_idx:
+                # DROPOUT === unobserved under this contract (see module
+                # docstring): return None so this reuses the exact same
+                # "marginalize out" code path as a genuinely missing key,
+                # rather than a separately-implemented equivalent branch.
+                return None
+
         return value
 
     def _validate_evidence_keys(self, evidence: Dict[str, EvidenceValue]) -> None:
@@ -176,12 +248,29 @@ class BayesianInferenceEngine:
         row-major list (index = o * n_decel + d = o * 3 + d).
 
         evidence may supply any subset of {"LidarObs", "TofObs",
-        "WheelSlipObs"}; a missing key or an explicit value of None both
-        mean "not observed" and marginalize that sensor out analytically
-        (likelihood factor 1.0), rather than summing over its 3 states --
-        a CPT row already sums to 1.0, so the two are mathematically
-        equivalent, but the former is O(1) per sensor instead of O(states).
+        "WheelSlipObs"}; a missing key, an explicit value of None, or (when
+        marginalize_dropout_state, the default, is set) that sensor's
+        DROPOUT value all mean "not observed" and marginalize that sensor
+        out analytically (likelihood factor 1.0), rather than summing over
+        its 3 states -- a CPT row already sums to 1.0, so the two are
+        mathematically equivalent, but the former is O(1) per sensor
+        instead of O(states).
+
+        If the supplied evidence is contradictory/degenerate under this
+        model (joint likelihood below the zero-likelihood guard), the
+        model's true physical prior P(TrueObstacle, DecelCapability) is
+        returned instead of dividing by (near) zero -- see
+        _compute_posterior_with_diagnostics for the flag that reports when
+        this happened; step() also surfaces it as "fallback_active".
         """
+        posterior, _fallback_active = self._compute_posterior_with_diagnostics(evidence)
+        return posterior
+
+    def _compute_posterior_with_diagnostics(self, evidence: Dict[str, EvidenceValue]) -> Tuple[List[float], bool]:
+        """compute_posterior()'s actual implementation, additionally
+        reporting whether the zero-likelihood fallback was used -- kept
+        separate so step() can force a safe action when it was, without
+        compute_posterior()'s public return type needing to change."""
         self._validate_evidence_keys(evidence)
         lidar_val = self._extract_evidence_value(evidence, "LidarObs")
         tof_val = self._extract_evidence_value(evidence, "TofObs")
@@ -220,11 +309,13 @@ class BayesianInferenceEngine:
         likelihood = math.fsum(unnormalized)
         if likelihood < _ZERO_LIKELIHOOD_GUARD:
             # Contradictory/degenerate evidence under this model: rather
-            # than divide by (near) zero, fall back to a uniform posterior.
-            uniform = 1.0 / self._n_posterior
-            return [uniform] * self._n_posterior
+            # than divide by (near) zero -- or return an arbitrary uniform
+            # guess -- fall back to the model's true physical prior
+            # P(TrueObstacle, DecelCapability), and flag that this
+            # happened so callers (step()) can force a safe decision.
+            return list(self._prior_marginal), True
 
-        return [v / likelihood for v in unnormalized]
+        return [v / likelihood for v in unnormalized], False
 
     # ------------------------------------------------------------------
     # Decision
@@ -238,9 +329,23 @@ class BayesianInferenceEngine:
         Ties are broken deterministically toward safety: EMERGENCY_BRAKE is
         preferred over COAST, which is preferred over ACCEL, regardless of
         the actions list's declared order.
+
+        `posterior` must be an exactly-normalized probability distribution:
+        the right length, every entry finite and in [0.0, 1.0], summing to
+        1.0 within 1e-12. Any violation raises ValueError -- this method
+        does not attempt to silently renormalize or clip a malformed input,
+        since that could mask an upstream bug.
+
+        If the loss matrix itself somehow yields a non-finite expected loss
+        for some action (never possible with the sealed model, whose loss
+        values are validated finite at compile time -- this is defense in
+        depth against a corrupted matrix at runtime), the safety tie-break
+        alone is not trustworthy: comparisons against NaN are neither true
+        nor false in a consistent way, so ordinary min()-based selection
+        could silently pick an unsafe action. In that case EMERGENCY_BRAKE
+        is selected outright, never ACCEL.
         """
-        if len(posterior) != self._n_posterior:
-            raise ValueError(f"posterior must have {self._n_posterior} entries, got {len(posterior)}")
+        self._validate_posterior(posterior)
 
         n_actions = len(self._actions)
         stride = self._loss_action_stride
@@ -249,8 +354,23 @@ class BayesianInferenceEngine:
             block = self._loss_values[a * stride : a * stride + stride]
             expected_losses.append(math.fsum(p * loss for p, loss in zip(posterior, block)))
 
-        best_idx = self._select_best_action_index(expected_losses)
+        if not all(math.isfinite(v) for v in expected_losses):
+            best_idx = self._emergency_brake_index
+        else:
+            best_idx = self._select_best_action_index(expected_losses)
         return expected_losses, self._actions[best_idx], best_idx
+
+    def _validate_posterior(self, posterior: List[float]) -> None:
+        if len(posterior) != self._n_posterior:
+            raise ValueError(f"posterior must have {self._n_posterior} entries, got {len(posterior)}")
+        for p in posterior:
+            if not math.isfinite(p):
+                raise ValueError(f"posterior entry {p!r} is not finite (NaN/Inf are not valid probabilities)")
+            if not 0.0 <= p <= 1.0:
+                raise ValueError(f"posterior entry {p!r} is out of the valid probability range [0.0, 1.0]")
+        total = math.fsum(posterior)
+        if not math.isclose(total, 1.0, rel_tol=1e-12, abs_tol=1e-12):
+            raise ValueError(f"posterior does not sum to 1.0 (sum={total!r}); expected a normalized distribution")
 
     def _select_best_action_index(self, expected_losses: List[float]) -> int:
         return min(
@@ -265,9 +385,25 @@ class BayesianInferenceEngine:
     # High-level pipeline
     # ------------------------------------------------------------------
     def step(self, evidence: Dict[str, EvidenceValue]) -> dict:
-        """Run inference then decision selection in one call."""
-        posterior = self.compute_posterior(evidence)
-        expected_losses, best_action_name, best_action_idx = self.evaluate_expected_loss(posterior)
+        """
+        Run inference then decision selection in one call.
+
+        If the supplied evidence was contradictory/degenerate (see
+        compute_posterior), the returned posterior is the model's true
+        prior rather than something actually informed by this evidence --
+        trusting expected-loss minimization over it would be misplaced
+        confidence, so the action is forced to EMERGENCY_BRAKE outright in
+        that case, and "fallback_active" is set to True so callers can tell
+        the difference from an ordinary, evidence-driven decision.
+        """
+        posterior, fallback_active = self._compute_posterior_with_diagnostics(evidence)
+
+        if fallback_active:
+            expected_losses, _ignored_action, _ignored_idx = self.evaluate_expected_loss(posterior)
+            best_idx = self._emergency_brake_index
+            best_action_name = self._actions[best_idx]
+        else:
+            expected_losses, best_action_name, best_idx = self.evaluate_expected_loss(posterior)
 
         return {
             "posterior": posterior,
@@ -275,7 +411,8 @@ class BayesianInferenceEngine:
             "expected_losses": expected_losses,
             "expected_losses_hex": [v.hex() for v in expected_losses],
             "selected_action": best_action_name,
-            "selected_action_index": best_action_idx,
+            "selected_action_index": best_idx,
+            "fallback_active": fallback_active,
         }
 
 

@@ -2,13 +2,19 @@
 Factor reduction & expected-loss inference engine -- verification suite
 (Task 2.2).
 
-Covers: sealed ir_digest custody enforcement (both self-consistency and
+Hardened per the Astra audit's 3 HOLD findings on commit 2708bd3e. Covers:
+sealed ir_digest custody enforcement (both self-consistency and
 baseline-match failure modes), exact-marginal correctness when sensors are
-unobserved, directional/qualitative correctness on deterministic corner
-evidence (full clear, full obstacle, critical slip alone, partial dropout),
-bit-exact expected-loss arithmetic against a hand-derived posterior,
-safety-first tie-breaking, and the zero-likelihood uniform-posterior guard
-for contradictory evidence.
+unobserved, the DROPOUT-state === unobserved equivalence contract
+(exhaustively, across all 64 evidence combinations), directional/
+qualitative correctness on deterministic corner evidence (full clear, full
+obstacle, critical slip alone, partial dropout), bit-exact expected-loss
+arithmetic against a hand-derived posterior, strict posterior bounds/
+normalization validation, safety-first tie-breaking (including under a
+non-finite expected loss, which must never resolve to ACCEL), and the
+zero-likelihood fallback to the model's true physical prior (with forced
+EMERGENCY_BRAKE selection and an explicit fallback_active flag) for
+contradictory evidence.
 
 Run directly:          python tests/test_inference_engine.py
 Verification command:  python -m unittest tests/test_inference_engine.py -v
@@ -273,6 +279,47 @@ class DeterministicCornerEvidenceTests(unittest.TestCase):
         self.assertTrue(all(0.0 <= p <= 1.0 for p in partial["posterior"]))
 
 
+class DropoutEquivalenceTests(unittest.TestCase):
+    """DROPOUT (state index 2) must be exactly equivalent to unobserved
+    (None) under the default marginalize_dropout_state=True contract."""
+
+    def test_exhaustive_64_combination_dropout_equals_none(self):
+        engine = BayesianInferenceEngine(str(MODEL_PATH))
+        sensor_values = (0, 1, 2, None)  # 4 values x 3 sensors = 64 combinations
+
+        checked = 0
+        for lidar in sensor_values:
+            for tof in sensor_values:
+                for wheel in sensor_values:
+                    evidence = {"LidarObs": lidar, "TofObs": tof, "WheelSlipObs": wheel}
+                    canonical = {k: (None if v == 2 else v) for k, v in evidence.items()}
+
+                    with self.subTest(evidence=evidence):
+                        posterior = engine.compute_posterior(evidence)
+                        canonical_posterior = engine.compute_posterior(canonical)
+                        self.assertEqual(posterior, canonical_posterior)
+
+                        result = engine.step(evidence)
+                        canonical_result = engine.step(canonical)
+                        self.assertEqual(result["selected_action"], canonical_result["selected_action"])
+                        self.assertEqual(result["expected_losses"], canonical_result["expected_losses"])
+                    checked += 1
+
+        self.assertEqual(checked, 64)
+
+    def test_disabling_the_flag_makes_dropout_and_none_genuinely_differ(self):
+        # Proves the equivalence above comes from the contract being active,
+        # not from DROPOUT and None coincidentally always agreeing anyway.
+        engine = BayesianInferenceEngine(str(MODEL_PATH), marginalize_dropout_state=False)
+        posterior_none = engine.compute_posterior({"LidarObs": None, "TofObs": 1, "WheelSlipObs": 0})
+        posterior_dropout = engine.compute_posterior({"LidarObs": 2, "TofObs": 1, "WheelSlipObs": 0})
+        self.assertNotEqual(posterior_none, posterior_dropout)
+
+    def test_flag_defaults_to_true(self):
+        engine = BayesianInferenceEngine(str(MODEL_PATH))
+        self.assertTrue(engine.marginalize_dropout_state)
+
+
 class ExpectedLossArithmeticTests(unittest.TestCase):
     def setUp(self):
         self.engine = BayesianInferenceEngine(str(MODEL_PATH))
@@ -361,37 +408,125 @@ class TieBreakingTests(unittest.TestCase):
         self.assertEqual(engine._select_best_action_index([1.0, 0.5, 0.5]), 2)  # COAST/EBRAKE tie, EBRAKE wins
 
 
+class PosteriorValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = BayesianInferenceEngine(str(MODEL_PATH))
+
+    def test_nan_posterior_rejected(self):
+        with self.assertRaises(ValueError):
+            self.engine.evaluate_expected_loss([float("nan")] * 6)
+
+    def test_inf_posterior_rejected(self):
+        with self.assertRaises(ValueError):
+            self.engine.evaluate_expected_loss([float("inf")] + [0.0] * 5)
+        with self.assertRaises(ValueError):
+            self.engine.evaluate_expected_loss([float("-inf")] + [0.0] * 5)
+
+    def test_negative_probability_rejected(self):
+        with self.assertRaises(ValueError):
+            self.engine.evaluate_expected_loss([-0.1, 0.2, 0.2, 0.2, 0.2, 0.3])
+
+    def test_probability_above_one_rejected(self):
+        with self.assertRaises(ValueError):
+            self.engine.evaluate_expected_loss([1.1, -0.1, 0.0, 0.0, 0.0, 0.0])
+
+    def test_unnormalized_posterior_rejected(self):
+        # every entry individually valid ([0,1], finite) but the vector
+        # doesn't sum to 1.0
+        with self.assertRaises(ValueError):
+            self.engine.evaluate_expected_loss([0.5, 0.5, 0.5, 0.0, 0.0, 0.0])  # sums to 1.5
+
+    def test_slightly_off_normalization_within_tolerance_is_accepted(self):
+        posterior = [1.0 / 6.0] * 6  # sums to bit-exact 1.0 via IEEE 754, well within 1e-12
+        self.engine.evaluate_expected_loss(posterior)  # must not raise
+
+    def test_wrong_length_posterior_rejected_by_evaluate_expected_loss(self):
+        with self.assertRaises(ValueError):
+            self.engine.evaluate_expected_loss([0.2, 0.2, 0.2, 0.2, 0.2])  # 5, not 6
+
+    def test_nonfinite_expected_loss_forces_emergency_brake_never_accel(self):
+        # A corrupted loss matrix (never possible with the sealed model,
+        # whose values are validated finite at compile time -- this is
+        # defense in depth) that makes ACCEL's expected loss NaN must not
+        # be allowed to win a NaN-involving comparison by accident: the
+        # engine must force EMERGENCY_BRAKE outright, and never ACCEL.
+        original_loss_values = self.engine._loss_values
+        try:
+            corrupted = list(original_loss_values)
+            corrupted[0] = float("nan")  # ACCEL's first cell
+            self.engine._loss_values = corrupted
+
+            posterior = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # concentrates all mass on that cell
+            expected_losses, best_action, best_idx = self.engine.evaluate_expected_loss(posterior)
+
+            self.assertTrue(math.isnan(expected_losses[0]))
+            self.assertNotEqual(best_action, "ACCEL")
+            self.assertEqual(best_action, "EMERGENCY_BRAKE")
+            self.assertEqual(best_idx, self.engine._emergency_brake_index)
+        finally:
+            self.engine._loss_values = original_loss_values
+
+    def test_infinite_expected_loss_also_forces_emergency_brake(self):
+        original_loss_values = self.engine._loss_values
+        try:
+            corrupted = list(original_loss_values)
+            corrupted[6] = float("inf")  # COAST's first cell
+            self.engine._loss_values = corrupted
+
+            posterior = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            _expected_losses, best_action, _best_idx = self.engine.evaluate_expected_loss(posterior)
+            self.assertEqual(best_action, "EMERGENCY_BRAKE")
+        finally:
+            self.engine._loss_values = original_loss_values
+
+
 class ZeroLikelihoodGuardTests(unittest.TestCase):
-    def test_contradictory_evidence_returns_uniform_without_crashing(self):
+    def test_contradictory_evidence_falls_back_to_true_prior_without_crashing(self):
         engine = BayesianInferenceEngine(str(MODEL_PATH))
         original_lidar_cpt = engine._sensor_cpt["LidarObs"]
         try:
-            # Force P(LidarObs=DROPOUT | TrueObstacle=*) = 0.0 for every
-            # TrueObstacle state, i.e. "this sensor physically cannot drop
-            # out" -- then observing a dropout is a genuine contradiction
-            # under the (patched) model, driving the joint likelihood to
-            # exactly 0.0 regardless of TrackCondition/DecelCapability.
-            engine._sensor_cpt["LidarObs"] = [0.5, 0.5, 0.0, 0.5, 0.5, 0.0]
-            posterior = engine.compute_posterior({"LidarObs": 2})
+            # Force P(LidarObs=DETECTED | TrueObstacle=*) = 0.0 for every
+            # TrueObstacle state, i.e. "this sensor physically cannot report
+            # DETECTED" -- then observing DETECTED(1) is a genuine
+            # contradiction under the (patched) model, driving the joint
+            # likelihood to exactly 0.0 regardless of TrackCondition/
+            # DecelCapability. (Not state 2/DROPOUT: with the default
+            # dropout<->None contract, evidence=2 would be marginalized
+            # out before ever reaching this CPT, and couldn't force a
+            # contradiction -- see DropoutEquivalenceTests.)
+            engine._sensor_cpt["LidarObs"] = [0.5, 0.0, 0.5, 0.5, 0.0, 0.5]
+            posterior, fallback_active = engine._compute_posterior_with_diagnostics({"LidarObs": 1})
 
+            self.assertTrue(fallback_active)
             self.assertEqual(len(posterior), 6)
             self.assertTrue(all(math.isfinite(p) for p in posterior))
             self.assertAlmostEqual(math.fsum(posterior), 1.0, delta=1e-12)
-            # falls back to exactly uniform
-            for p in posterior:
-                self.assertAlmostEqual(p, 1.0 / 6.0, delta=1e-15)
+            # falls back to the model's true physical prior, not an
+            # arbitrary uniform guess
+            self.assertEqual(posterior, engine._prior_marginal)
         finally:
             engine._sensor_cpt["LidarObs"] = original_lidar_cpt
 
-    def test_uniform_guard_still_produces_a_valid_downstream_decision(self):
+    def test_fallback_forces_emergency_brake_and_flags_fallback_active(self):
         engine = BayesianInferenceEngine(str(MODEL_PATH))
         original_lidar_cpt = engine._sensor_cpt["LidarObs"]
         try:
-            engine._sensor_cpt["LidarObs"] = [0.5, 0.5, 0.0, 0.5, 0.5, 0.0]
-            result = engine.step({"LidarObs": 2})
-            self.assertIn(result["selected_action"], engine._actions)
+            engine._sensor_cpt["LidarObs"] = [0.5, 0.0, 0.5, 0.5, 0.0, 0.5]
+            result = engine.step({"LidarObs": 1})
+
+            self.assertTrue(result["fallback_active"])
+            self.assertEqual(result["selected_action"], "EMERGENCY_BRAKE")
+            self.assertEqual(result["selected_action_index"], engine._emergency_brake_index)
+            self.assertEqual(result["posterior"], engine._prior_marginal)
         finally:
             engine._sensor_cpt["LidarObs"] = original_lidar_cpt
+
+    def test_ordinary_evidence_never_sets_fallback_active(self):
+        engine = BayesianInferenceEngine(str(MODEL_PATH))
+        for evidence in ({}, {"LidarObs": 0}, {"LidarObs": 1, "TofObs": 1, "WheelSlipObs": 0}):
+            with self.subTest(evidence=evidence):
+                result = engine.step(evidence)
+                self.assertFalse(result["fallback_active"])
 
     def test_real_model_has_no_naturally_zero_probability_evidence(self):
         # Documents *why* the guard above needs to monkeypatch to trigger:
