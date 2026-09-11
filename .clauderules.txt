@@ -1,0 +1,19 @@
+# HIRAM HIGH-ASSURANCE KERNEL — RIGID ENGINEERING INVARIANTS
+
+1. SEPARATION OF CONCERNS (NO SELF-WRITTEN TESTS)
+- You are strictly prohibited from generating, modifying, or weakening test assertions to make your implementation pass.
+- Test suites in `tests/` represent frozen acceptance criteria. If your code fails a test, the defect is in your implementation, NOT in the test criteria.
+- Never write tests that test implementation details; test only external interface specifications and boundary conditions.
+
+2. EXHAUSTIVE PIECEWISE DOMAIN SPECIFICATION
+- Never implement an equation without first accounting for all operational regimes:
+  * Minimum/Zero boundary: x = 0, v = 0, dt = 0, t = 0.
+  * Saturation/Maximum boundary: x >= limit, v >= v_cruise, a >= a_max.
+  * Directional transitions: a > 0 (accel), a == 0 (coast), a < 0 (brake).
+  * Boundary equality and initial penetration: x_initial >= obstacle_x.
+- Zero-crossing handling: Any step reaching zero velocity or crossing a threshold must use analytical partial-step equations, NEVER coarse full-tick approximations.
+
+3. ADVERSARIAL SELF-VALIDATION & ZERO-HEAP CONSTRAINTS
+- For C implementations: Absolutely NO dynamic allocation (`malloc`, `free`, `calloc`, `alloca`, VLAs). DTCM footprint must remain strictly under 40 KB.
+- Before claiming any task is complete, you must run `python tools/pre_audit_verifier.py`. If this script reports a single failure, the task is incomplete.
+- Do not output subjective claims of success ("this is fully verified", "works perfectly"). Output only raw test outputs, exit codes, and diffs.
