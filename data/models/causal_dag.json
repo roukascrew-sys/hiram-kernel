@@ -272,5 +272,6 @@
     },
     "total_parameters": 18
   },
-  "digest": "ffe27d9f87ea5aa9260d805b56db348969bed0aeeb177c3c70d77d3439e25d76"
+  "digest": "ffe27d9f87ea5aa9260d805b56db348969bed0aeeb177c3c70d77d3439e25d76",
+  "ir_digest": "b39845824f903e9230c75110ffd822ccea36cd89a5ebb4eae1235ff4860b57e7"
 }

@@ -1,16 +1,23 @@
 """
-Compiler-driven causal DAG construction -- verification suite (Task 2.1).
+Compiler-driven causal DAG construction -- verification suite (Task 2.1,
+hardened per the Astra audit's 7 HOLD findings on commit a67479c9).
 
 Covers: topological ordering (parent precedence, determinism, cycle
-detection), CPT row-sum validation, stride computation and flat indexing
-against known table coordinates (for both node CPTs and the loss matrix),
-bit-exact float.hex()/float.fromhex() round-tripping, loss-matrix shape
-validation, and the tri-state dropout-index invariant for sensor nodes.
+detection), CPT row-sum validation (rel_tol=1e-12, abs_tol=1e-12), CPT/loss
+value bounds and finiteness (rejecting NaN/Inf and out-of-[0,1] probabilities),
+duplicate parents/state-dependencies/actions/states, stride computation and
+flat indexing against known table coordinates (for both node CPTs and the
+loss matrix), bit-exact float.hex()/float.fromhex() round-tripping, the
+"ir_digest" canonical-JSON seal over the entire compiled dictionary (and its
+tamper-detection property against strides/metadata mutation), loss-matrix
+shape validation, and the tri-state dropout-index invariant for sensor nodes.
 
 Run directly:          python tests/test_causal_dag.py
 Verification command:  python -m unittest tests/test_causal_dag.py -v
 """
 
+import copy
+import hashlib
 import json
 import math
 import pathlib
@@ -21,6 +28,18 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from tools.cart_model import CausalDAGBuilder, build_default_cart_model  # noqa: E402
+
+ROW_SUM_REL_TOL = 1e-12
+ROW_SUM_ABS_TOL = 1e-12
+
+
+def _recompute_ir_digest(ir: dict) -> str:
+    """Mirrors CausalDAGBuilder.compile()'s canonical outer seal exactly, so
+    tests can verify tamper-detection without reaching into private internals."""
+    compiled_without_digest = {k: v for k, v in ir.items() if k not in ("digest", "ir_digest")}
+    return hashlib.sha256(
+        json.dumps(compiled_without_digest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _default_compiled():
@@ -94,6 +113,64 @@ class TopologicalSortTests(unittest.TestCase):
             builder.topological_sort()
 
 
+class DefensiveValidationTests(unittest.TestCase):
+    """Auditor-probe regressions: duplicate identifiers and non-finite
+    values must be rejected at the earliest point they can be detected
+    (add_node/set_loss_matrix for structural duplicates and loss-matrix
+    finiteness; compile() for CPT bounds/finiteness, which can't be fully
+    checked until node's own values are known)."""
+
+    def test_duplicate_parents_rejected(self):
+        builder = CausalDAGBuilder()
+        builder.add_node("P", ["a", "b"], [], [0.5, 0.5])
+        with self.assertRaises(ValueError):
+            builder.add_node("C", ["x", "y"], ["P", "P"], [0.25, 0.25, 0.25, 0.25])
+
+    def test_duplicate_states_rejected(self):
+        builder = CausalDAGBuilder()
+        with self.assertRaises(ValueError):
+            builder.add_node("Dup", ["a", "a"], [], [0.5, 0.5])
+
+    def test_duplicate_loss_dependencies_rejected(self):
+        builder = build_default_cart_model()
+        with self.assertRaises(ValueError):
+            builder.set_loss_matrix(
+                actions=["A"],
+                state_dependencies=["TrueObstacle", "TrueObstacle"],
+                matrix=[1.0, 2.0, 3.0, 4.0],
+            )
+
+    def test_duplicate_actions_rejected(self):
+        builder = build_default_cart_model()
+        with self.assertRaises(ValueError):
+            builder.set_loss_matrix(
+                actions=["ACCEL", "ACCEL"],
+                state_dependencies=[],
+                matrix=[1.0, 2.0],
+            )
+
+    def test_nan_in_loss_matrix_rejected_at_set_time(self):
+        builder = build_default_cart_model()
+        with self.assertRaises(ValueError):
+            builder.set_loss_matrix(actions=["A"], state_dependencies=[], matrix=[float("nan")])
+
+    def test_inf_in_loss_matrix_rejected_at_set_time(self):
+        builder = build_default_cart_model()
+        with self.assertRaises(ValueError):
+            builder.set_loss_matrix(actions=["A"], state_dependencies=[], matrix=[float("inf")])
+
+    def test_non_finite_loss_matrix_also_rejected_at_compile(self):
+        # Defense in depth: even if a non-finite value somehow reached the
+        # stored spec, compile() must independently catch it too.
+        builder = build_default_cart_model()
+        builder.set_loss_matrix(actions=["A"], state_dependencies=[], matrix=[1.0])
+        builder._loss = builder._loss.__class__(
+            actions=("A",), state_dependencies=(), matrix=(float("inf"),)
+        )
+        with self.assertRaises(ValueError):
+            builder.compile()
+
+
 class CptRowSumTests(unittest.TestCase):
     def test_default_model_all_rows_sum_to_one(self):
         ir = _default_compiled()
@@ -104,7 +181,7 @@ class CptRowSumTests(unittest.TestCase):
             for row in range(n_rows):
                 row_vals = cpt[row * len(states) : (row + 1) * len(states)]
                 self.assertTrue(
-                    math.isclose(math.fsum(row_vals), 1.0, rel_tol=1e-9, abs_tol=1e-9),
+                    math.isclose(math.fsum(row_vals), 1.0, rel_tol=ROW_SUM_REL_TOL, abs_tol=ROW_SUM_ABS_TOL),
                     f"{name} row {row} = {row_vals} sums to {math.fsum(row_vals)}",
                 )
 
@@ -116,8 +193,9 @@ class CptRowSumTests(unittest.TestCase):
 
     def test_row_sum_tolerance_accepts_float_noise_rejects_real_error(self):
         builder_ok = CausalDAGBuilder()
-        # classic float64 imprecision: 0.1 + 0.2 != 0.3 exactly, but the sum
-        # of a full row here is within math.isclose's tolerance of 1.0
+        # classic float64 imprecision: 0.1 + 0.2 != 0.3 exactly, but
+        # math.fsum's correctly-rounded sum of this row is bit-exact 1.0,
+        # well within the tightened 1e-12 tolerance.
         builder_ok.add_node("AlmostOne", ["x", "y", "z"], [], [0.1, 0.2, 0.7])
         ir = builder_ok.compile()  # must not raise
         self.assertIn("AlmostOne", ir["nodes"])
@@ -131,6 +209,33 @@ class CptRowSumTests(unittest.TestCase):
         builder = CausalDAGBuilder()
         builder.add_node("Parent", ["a", "b"], [], [0.5, 0.5])
         builder.add_node("Child", ["x", "y"], ["Parent"], [1.0, 0.0, 0.0])  # needs 4 entries, has 3
+        with self.assertRaises(ValueError):
+            builder.compile()
+
+    def test_out_of_range_probability_rejected(self):
+        # Auditor probe: a row that technically sums to 1.0 (-0.1 + 1.1) but
+        # contains an out-of-[0,1] value must still be rejected -- row-sum
+        # normalization alone is not sufficient validation.
+        builder = CausalDAGBuilder()
+        builder.add_node("OutOfRange", ["x", "y"], [], [-0.1, 1.1])
+        with self.assertRaises(ValueError):
+            builder.compile()
+
+    def test_negative_probability_rejected_even_with_valid_row_sum(self):
+        builder = CausalDAGBuilder()
+        builder.add_node("Negative", ["x", "y", "z"], [], [-0.5, 1.0, 0.5])  # sums to 1.0
+        with self.assertRaises(ValueError):
+            builder.compile()
+
+    def test_nan_in_cpt_rejected(self):
+        builder = CausalDAGBuilder()
+        builder.add_node("NanRow", ["x", "y"], [], [float("nan"), 1.0])
+        with self.assertRaises(ValueError):
+            builder.compile()
+
+    def test_inf_in_cpt_rejected(self):
+        builder = CausalDAGBuilder()
+        builder.add_node("InfRow", ["x", "y"], [], [float("inf"), float("-inf")])
         with self.assertRaises(ValueError):
             builder.compile()
 
@@ -309,6 +414,75 @@ class FloatHexRoundTripTests(unittest.TestCase):
         self.assertNotEqual(ir_a["digest"], ir_c["digest"])
 
 
+class IrDigestSealTests(unittest.TestCase):
+    """The broader "ir_digest" seal (canonical JSON over the *entire*
+    compiled dictionary) must invalidate on tampering anywhere in the IR --
+    strides, metadata flags, or probabilities -- not just the curated
+    numeric/structural fields "digest" covers."""
+
+    def test_ir_digest_present_and_valid_hex(self):
+        ir = _default_compiled()
+        self.assertIn("ir_digest", ir)
+        self.assertEqual(len(ir["ir_digest"]), 64)  # sha256 hex length
+        int(ir["ir_digest"], 16)  # must be valid hex
+
+    def test_ir_digest_matches_canonical_recomputation(self):
+        ir = _default_compiled()
+        self.assertEqual(ir["ir_digest"], _recompute_ir_digest(ir))
+
+    def test_ir_digest_stable_across_recompiles(self):
+        ir_a = _default_compiled()
+        ir_b = _default_compiled()
+        self.assertEqual(ir_a["ir_digest"], ir_b["ir_digest"])
+        self.assertEqual(ir_a, ir_b)  # strict full-object equality of two untampered compiles
+
+    def test_mutated_parent_strides_fails_equality_and_digest_verification(self):
+        ir = _default_compiled()
+        tampered = copy.deepcopy(ir)
+        tampered["nodes"]["TrueObstacle"]["parent_strides"]["TrackCondition"] = 999
+
+        # strict full-object equality against the original must fail
+        self.assertNotEqual(ir, tampered)
+
+        # digest *verification* (recompute from content, compare to the
+        # stored seal) must fail: the stored ir_digest is now stale relative
+        # to the tampered content.
+        self.assertNotEqual(tampered["ir_digest"], _recompute_ir_digest(tampered))
+
+    def test_mutated_metadata_flag_fails_equality_and_digest_verification(self):
+        ir = _default_compiled()
+        tampered = copy.deepcopy(ir)
+        tampered["nodes"]["LidarObs"]["is_sensor_variable"] = False  # metadata, not a probability
+
+        self.assertNotEqual(ir, tampered)
+        self.assertNotEqual(tampered["ir_digest"], _recompute_ir_digest(tampered))
+
+    def test_mutated_probability_fails_equality_and_digest_verification(self):
+        ir = _default_compiled()
+        tampered = copy.deepcopy(ir)
+        tampered["nodes"]["TrackCondition"]["cpt"][0] = 0.71  # was 0.70
+
+        self.assertNotEqual(ir, tampered)
+        self.assertNotEqual(tampered["ir_digest"], _recompute_ir_digest(tampered))
+
+    def test_mutated_loss_matrix_entry_fails_digest_verification(self):
+        ir = _default_compiled()
+        tampered = copy.deepcopy(ir)
+        tampered["loss_matrix"]["matrix"][0] = 1.0  # was 0.0
+
+        self.assertNotEqual(ir, tampered)
+        self.assertNotEqual(tampered["ir_digest"], _recompute_ir_digest(tampered))
+
+    def test_untampered_ir_round_tripped_through_json_still_verifies(self):
+        # Sanity check that the tamper-detection tests above aren't
+        # vacuously passing due to JSON round-tripping itself perturbing
+        # the digest (e.g. via key ordering or float formatting).
+        ir = _default_compiled()
+        restored = json.loads(json.dumps(ir))
+        self.assertEqual(restored["ir_digest"], _recompute_ir_digest(restored))
+        self.assertEqual(restored["ir_digest"], ir["ir_digest"])
+
+
 class TriStateDropoutInvariantTests(unittest.TestCase):
     def test_sensor_nodes_flag_dropout_state_index(self):
         ir = _default_compiled()
@@ -335,7 +509,9 @@ class CliGenerationTests(unittest.TestCase):
         on_disk = json.loads(output_path.read_text(encoding="utf-8"))
         fresh = _default_compiled()
         self.assertEqual(on_disk["digest"], fresh["digest"])
+        self.assertEqual(on_disk["ir_digest"], fresh["ir_digest"])
         self.assertEqual(on_disk["topological_order"], fresh["topological_order"])
+        self.assertEqual(on_disk["ir_digest"], _recompute_ir_digest(on_disk))
 
 
 if __name__ == "__main__":

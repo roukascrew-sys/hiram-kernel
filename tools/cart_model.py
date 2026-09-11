@@ -30,6 +30,17 @@ Invariant preservation:
     node has no such state) so a downstream evaluator can treat that index
     as "no evidence" consistently, without needing to special-case a
     string comparison against "DROPOUT" itself.
+  * Defensive boundary validation (hardened in response to the Astra audit
+    on commit a67479c9): duplicate parents/state-dependencies/actions/
+    states are rejected at construction time; every CPT and loss-matrix
+    value must be finite (no NaN/Inf); every CPT value must additionally
+    lie in [0.0, 1.0]; row-sum normalization is checked to rel_tol=1e-12,
+    abs_tol=1e-12 (tightened from 1e-9). compile() adds a second seal,
+    "ir_digest", over the *entire* compiled dictionary via canonical JSON
+    (sort_keys + fixed separators) -- unlike "digest" (which hashes only
+    the curated numeric/structural fields), ir_digest also invalidates on
+    tampering with strides, stride-derived metadata, or flags anywhere in
+    the IR.
 """
 
 import hashlib
@@ -114,6 +125,8 @@ class CausalDAGBuilder:
             raise ValueError(f"node '{name}': states must be non-empty")
         if len(set(states)) != len(states):
             raise ValueError(f"node '{name}': states must be unique, got {states!r}")
+        if len(set(parents)) != len(parents):
+            raise ValueError(f"node '{name}': parents must be unique, got {parents!r}")
         if name in parents:
             raise ValueError(f"node '{name}': cannot list itself as its own parent")
         if not cpt:
@@ -136,8 +149,13 @@ class CausalDAGBuilder:
             raise ValueError("loss matrix: actions must be non-empty")
         if len(set(actions)) != len(actions):
             raise ValueError(f"loss matrix: actions must be unique, got {actions!r}")
+        if len(set(state_dependencies)) != len(state_dependencies):
+            raise ValueError(f"loss matrix: state_dependencies must be unique, got {state_dependencies!r}")
         if not matrix:
             raise ValueError("loss matrix: matrix must be non-empty")
+        for v in matrix:
+            if not math.isfinite(v):
+                raise ValueError(f"loss matrix: entry {v!r} is not finite (NaN/Inf are not permitted losses)")
 
         self._loss = _LossSpec(
             actions=tuple(actions),
@@ -279,11 +297,16 @@ class CausalDAGBuilder:
     # ------------------------------------------------------------------
     def compile(self) -> dict:
         """
-        Validate the full DAG (acyclic, every CPT row sums to 1.0, the loss
-        matrix's shape matches its declared dependencies) and export a
-        structured, JSON-serializable IR: flat row-major CPTs and loss
-        matrix, precomputed strides, lossless float.hex() encodings of
-        every parameter, and a SHA-256 digest sealing the whole IR.
+        Validate the full DAG (acyclic; every CPT entry finite and in
+        [0.0, 1.0]; every CPT row sums to 1.0 within 1e-12; the loss
+        matrix's shape matches its declared dependencies and every entry is
+        finite) and export a structured, JSON-serializable IR: flat
+        row-major CPTs and loss matrix, precomputed strides, lossless
+        float.hex() encodings of every parameter, a SHA-256 "digest" over
+        the curated numeric/structural fields, and a broader SHA-256
+        "ir_digest" over the entire compiled dictionary (via canonical
+        JSON) that invalidates on tampering with strides, metadata, or
+        probabilities anywhere in the IR.
         """
         order = self.topological_sort()
 
@@ -299,12 +322,18 @@ class CausalDAGBuilder:
                     f"{' x ' if spec.parents else ''}{len(spec.states)})"
                 )
 
+            for p in spec.cpt:
+                if not math.isfinite(p):
+                    raise ValueError(f"node '{name}': cpt entry {p!r} is not finite (NaN/Inf are not valid probabilities)")
+                if not 0.0 <= p <= 1.0:
+                    raise ValueError(f"node '{name}': cpt entry {p!r} is out of the valid probability range [0.0, 1.0]")
+
             n_states = len(spec.states)
             n_rows = total // n_states
             for row in range(n_rows):
                 row_vals = spec.cpt[row * n_states : (row + 1) * n_states]
                 row_sum = math.fsum(row_vals)
-                if not math.isclose(row_sum, 1.0, rel_tol=1e-9, abs_tol=1e-9):
+                if not math.isclose(row_sum, 1.0, rel_tol=1e-12, abs_tol=1e-12):
                     raise ValueError(
                         f"node '{name}' row {row} (values {row_vals}) sums to {row_sum!r}, expected 1.0"
                     )
@@ -337,6 +366,9 @@ class CausalDAGBuilder:
                     f"({len(self._loss.actions)} actions x "
                     f"{' x '.join(str(len(self._nodes[d].states)) for d in self._loss.state_dependencies)} states)"
                 )
+            for v in self._loss.matrix:
+                if not math.isfinite(v):
+                    raise ValueError(f"loss matrix: entry {v!r} is not finite (NaN/Inf are not permitted losses)")
 
             loss_ir = {
                 "actions": list(self._loss.actions),
@@ -355,6 +387,18 @@ class CausalDAGBuilder:
             "loss_matrix": loss_ir,
         }
         ir["digest"] = self._compute_digest(ir)
+
+        # Canonical outer seal: a SHA-256 over the *entire* compiled
+        # dictionary (every stride, metadata flag, and probability -- not
+        # just the curated fields "digest" above hashes), via a
+        # deterministic JSON encoding (sort_keys + fixed separators) so the
+        # digest doesn't depend on dict insertion order. Computed over the
+        # dict without "digest" itself, since a digest cannot cover its own
+        # sibling digest field without becoming circular.
+        compiled_without_digest = {k: v for k, v in ir.items() if k != "digest"}
+        ir["ir_digest"] = hashlib.sha256(
+            json.dumps(compiled_without_digest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         return ir
 
     # ------------------------------------------------------------------
@@ -464,6 +508,7 @@ def main() -> None:
     print(f"Loss matrix: {len(ir['loss_matrix']['matrix'])} entries over "
           f"{ir['loss_matrix']['actions']} x {ir['loss_matrix']['state_dependencies']}")
     print(f"Digest: {ir['digest']}")
+    print(f"IR digest: {ir['ir_digest']}")
     print(f"Wrote {output_path}")
 
 
