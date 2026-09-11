@@ -1,7 +1,7 @@
 """
 HIRAM Safety Kernel - Task 2.3 Verification Suite
 Closed-loop trajectory qualification, exact kinematic contact resolution,
-continuous evidence discretization, and moving dropout mitigation tests.
+continuous evidence discretization, boundary contact, and moving dropout mitigation tests.
 """
 
 import math
@@ -30,7 +30,7 @@ class TestKinematicContactResolution(unittest.TestCase):
             x0=0.0, v0=0.01, a_cmd=-1.0, dt=0.01, v_cruise=0.50, obstacle_x=0.000025
         )
         self.assertTrue(coll)
-        expected_v = math.sqrt(0.01**2 + 2.0 * (-1.0) * 0.000025)  # sqrt(0.000050)
+        expected_v = math.sqrt(0.01**2 + 2.0 * (-1.0) * 0.000025)
         expected_dt = (expected_v - 0.01) / (-1.0)
         self.assertAlmostEqual(c_v, expected_v, places=8)
         self.assertAlmostEqual(c_dt, expected_dt, places=8)
@@ -72,9 +72,6 @@ class TestKinematicContactResolution(unittest.TestCase):
         )
         self.assertTrue(coll)
         expected_v = 0.50
-        # dt_cruise = (0.50 - 0.499) / 0.25 = 0.004 s
-        # dx1 = (0.50^2 - 0.499^2) / (2 * 0.25) = 0.001998 m
-        # dt_contact = 0.004 + (0.003 - 0.001998) / 0.50 = 0.006004 s
         expected_dt = 0.004 + (0.003 - 0.001998) / 0.50
         self.assertAlmostEqual(c_v, expected_v, places=8)
         self.assertAlmostEqual(c_dt, expected_dt, places=8)
@@ -85,6 +82,16 @@ class TestKinematicContactResolution(unittest.TestCase):
             x0=0.0, v0=0.499, a_cmd=0.25, dt=0.02, v_cruise=0.50, obstacle_x=None
         )
         self.assertEqual(v_next, 0.50)
+
+    def test_initial_boundary_contact_in_solver(self):
+        """Astra Probe: starting at x0 = obstacle_x must immediately report contact."""
+        x_next, v_next, coll, c_dt, c_v = solve_step_kinematics_and_contact(
+            x0=0.20, v0=0.35, a_cmd=-1.0, dt=0.01, v_cruise=0.50, obstacle_x=0.20
+        )
+        self.assertTrue(coll)
+        self.assertEqual(c_dt, 0.0)
+        self.assertEqual(c_v, 0.35)
+        self.assertEqual(x_next, 0.20)
 
 
 class TestTrajectoryVerification(unittest.TestCase):
@@ -155,17 +162,51 @@ class TestTrajectoryVerification(unittest.TestCase):
         self.assertEqual(res.final_v, 0.0)
         self.assertLess(res.final_x, 0.80)
 
+    def test_initial_boundary_contact_episode_termination(self):
+        """Astra Probe: starting at x=obstacle_x=0.20 m, v=0.35 m/s immediately terminates."""
+        res = self.evaluator.run_episode(
+            initial_x=0.20,
+            initial_v=0.35,
+            max_duration=2.0,
+            obstacle_x=0.20,
+        )
+        self.assertTrue(res.collision)
+        self.assertEqual(res.contact_time, 0.0)
+        self.assertEqual(res.contact_velocity, 0.35)
+        self.assertEqual(res.final_x, 0.20)
+        self.assertEqual(res.final_v, 0.35)
+        self.assertEqual(res.total_time, 0.0)
+
+    def test_termination_at_first_contact_freezes_state(self):
+        """Cart hitting an obstacle terminates at impact time; does not advance beyond."""
+        res = self.evaluator.run_episode(
+            initial_x=0.0,
+            initial_v=0.35,
+            max_duration=2.0,
+            obstacle_x=0.20,
+            track_condition="WET",
+            decel_capability="CRITICAL",
+            override_brake_decel=0.24,
+        )
+        self.assertTrue(res.collision)
+        self.assertIsNotNone(res.contact_time)
+        self.assertEqual(res.final_x, 0.20)
+        self.assertEqual(res.final_v, res.contact_velocity)
+        self.assertEqual(res.total_time, res.contact_time)
+        self.assertAlmostEqual(res.x_history[-1], 0.20, places=6)
+
     def test_shift6_moving_constrained_mitigation_and_impact_energy(self):
         """
-        Moving start with degraded brakes (SHIFT_6) and constrained clearance.
-        Evaluates early brake deadline (<= 20 ms) and >= 75% kinetic energy reduction
-        measured strictly at the point of contact.
+        Moving start with degraded brakes and constrained clearance (0.20 m).
+        Compares degraded braking (0.24 m/s²) against an unmitigated constant-velocity
+        baseline (0.0 m/s² decel) for this scenario geometry.
+        Asserts early brake deadline (<= 20 ms) and >= 75% kinetic energy reduction.
         """
         v_init = 0.35
-        x_obs = 0.20  # Clearance 0.20 m < stopping distance 0.255 m ensures impact under degraded brakes
+        x_obs = 0.20
         cart_mass = 5.0
 
-        # 1. Unmitigated baseline (zero braking capability)
+        # 1. Unmitigated baseline (zero braking deceleration, maintains constant velocity)
         eval_unmitigated = TrajectoryEvaluator(self.engine, dt=0.010, v_cruise=0.50, cart_mass=cart_mass)
         res_baseline = eval_unmitigated.run_episode(
             initial_x=0.0,

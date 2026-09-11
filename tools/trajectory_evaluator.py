@@ -27,6 +27,11 @@ def solve_step_kinematics_and_contact(
     Returns:
         (x_next, v_next, collision, contact_dt, contact_v)
     """
+    # 0. Immediate boundary check: initial contact or initial penetration
+    if obstacle_x is not None and x0 >= obstacle_x:
+        # Starting at or beyond the obstacle boundary is immediate contact at t=0
+        return obstacle_x, v0, True, 0.0, v0
+
     # 1. Kinematic trajectory segmentation over dt
     if a_cmd < 0.0:
         dt_stop = -v0 / a_cmd if a_cmd != 0 else float("inf")
@@ -75,12 +80,12 @@ def solve_step_kinematics_and_contact(
         dx_total = dx1
 
     # 2. Contact resolution against obstacle_x
-    if obstacle_x is None or x0 >= obstacle_x:
+    if obstacle_x is None:
         return x_next, v_next, False, None, None
 
     d = obstacle_x - x0
     if d > dx_total:
-        # Step trajectory did not breach the obstacle boundary
+        # Step trajectory did not reach the obstacle boundary
         return x_next, v_next, False, None, None
 
     # Step breached obstacle: solve piecewise collision kinematics
@@ -241,6 +246,7 @@ class TrajectoryEvaluator:
     ) -> TrajectoryResult:
         """
         Executes a closed-loop discrete-time simulation episode.
+        Terminates immediately at first contact or when cart stops.
         """
         t = 0.0
         x = initial_x
@@ -253,10 +259,23 @@ class TrajectoryEvaluator:
         a_hist: List[float] = [a]
         action_hist: List[str] = []
 
-        collision = False
-        contact_time: Optional[float] = None
-        contact_velocity: Optional[float] = None
-        impact_energy: Optional[float] = None
+        # Check for immediate starting contact/penetration
+        if obstacle_x is not None and initial_x >= obstacle_x:
+            impact_e = 0.5 * self.cart_mass * (initial_v * initial_v)
+            return TrajectoryResult(
+                time_history=t_hist,
+                x_history=x_hist,
+                v_history=v_hist,
+                a_history=a_hist,
+                action_history=["EMERGENCY_BRAKE"],
+                collision=True,
+                contact_time=0.0,
+                contact_velocity=initial_v,
+                impact_energy=impact_e,
+                final_x=obstacle_x,
+                final_v=initial_v,
+                total_time=0.0,
+            )
 
         a_brake_mag = self._get_braking_deceleration(
             track_condition, decel_capability, override_brake_decel
@@ -299,11 +318,31 @@ class TrajectoryEvaluator:
                 obstacle_x=obstacle_x,
             )
 
-            if step_coll and not collision:
-                collision = True
+            if step_coll:
+                # Freeze state and terminate at exact first contact point
                 contact_time = t + c_dt
                 contact_velocity = c_v
                 impact_energy = 0.5 * self.cart_mass * (c_v * c_v)
+
+                t_hist.append(contact_time)
+                x_hist.append(obstacle_x)
+                v_hist.append(c_v)
+                a_hist.append(a_cmd)
+
+                return TrajectoryResult(
+                    time_history=t_hist,
+                    x_history=x_hist,
+                    v_history=v_hist,
+                    a_history=a_hist,
+                    action_history=action_hist,
+                    collision=True,
+                    contact_time=contact_time,
+                    contact_velocity=contact_velocity,
+                    impact_energy=impact_energy,
+                    final_x=obstacle_x,
+                    final_v=c_v,
+                    total_time=contact_time,
+                )
 
             # State update
             t += self.dt
@@ -326,10 +365,10 @@ class TrajectoryEvaluator:
             v_history=v_hist,
             a_history=a_hist,
             action_history=action_hist,
-            collision=collision,
-            contact_time=contact_time,
-            contact_velocity=contact_velocity,
-            impact_energy=impact_energy,
+            collision=False,
+            contact_time=None,
+            contact_velocity=None,
+            impact_energy=None,
             final_x=x,
             final_v=v,
             total_time=t,
