@@ -34,8 +34,11 @@ the certified model. Either mismatch raises ValueError.
 Determinism & bounds: every CPT/loss lookup is a plain list index computed
 from the model's own precomputed strides (never re-derived from scratch),
 so inference is a fixed, small number of arithmetic operations over
-statically-shaped row-major arrays -- no dynamic allocation, no recursion,
-no data-dependent control flow beyond which evidence values were supplied.
+statically-shaped row-major arrays, with no data-dependent control flow
+beyond which evidence values were supplied and no recursion. This shape is
+what makes the arithmetic portable to a static-memory target; see "Python
+Reference Engine" below for what that does and does not claim about this
+module itself.
 
 Tri-state evidence: each sensor's evidence value is an int in {0, 1, 2}
 (matching that sensor's 3 declared states, index 2 always being "DROPOUT"
