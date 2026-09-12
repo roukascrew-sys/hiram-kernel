@@ -38,3 +38,5 @@ tmp_test_*
 # docs/verification/dwt-capture-procedure.md for provenance and checksums.
 !docs/verification/firmware/*.bin
 !docs/verification/firmware/*.hex
+
+hiram_core_codebase.txt
