@@ -1,9 +1,10 @@
 /**
- * hiram_policy_lut.h - Compiled 64-State Policy-to-LUT Evaluator
+ * hiram_policy_lut.h - Compiled 64-State Policy-to-LUT Evaluator ABI
  *
  * Automatically synthesized from Bayesian C-Kernel decision policy.
  * Exact action selection over all 64 tri-state permutations.
- * Execution cost: 1 memory access / array lookup (~2 to 4 cycles on ARM Cortex-M7).
+ * Table and evaluator live in src/hiram_policy_lut.c (generated together
+ * with this header) so each has exactly one link-time placement.
  */
 
 #ifndef HIRAM_POLICY_LUT_H
@@ -17,37 +18,57 @@
 #define HIRAM_LUT_ACTION_COAST           1
 #define HIRAM_LUT_ACTION_EMERGENCY_BRAKE 2
 
-/* 64-byte pre-computed optimal Bayesian decision policy */
-static const uint8_t HIRAM_POLICY_LUT[64] = {
-    1, 1, 2, 1, /* [00]: L=-1,T=-1,S=-1->COAST; [01]: L=-1,T=-1,S=+0->COAST; [02]: L=-1,T=-1,S=+1->EMERGENCY_BRAKE; [03]: L=-1,T=-1,S=+2->COAST */
-    0, 0, 1, 0, /* [04]: L=-1,T=+0,S=-1->ACCEL; [05]: L=-1,T=+0,S=+0->ACCEL; [06]: L=-1,T=+0,S=+1->COAST; [07]: L=-1,T=+0,S=+2->ACCEL */
-    2, 2, 2, 2, /* [08]: L=-1,T=+1,S=-1->EMERGENCY_BRAKE; [09]: L=-1,T=+1,S=+0->EMERGENCY_BRAKE; [10]: L=-1,T=+1,S=+1->EMERGENCY_BRAKE; [11]: L=-1,T=+1,S=+2->EMERGENCY_BRAKE */
-    1, 1, 2, 1, /* [12]: L=-1,T=+2,S=-1->COAST; [13]: L=-1,T=+2,S=+0->COAST; [14]: L=-1,T=+2,S=+1->EMERGENCY_BRAKE; [15]: L=-1,T=+2,S=+2->COAST */
-    0, 0, 1, 0, /* [16]: L=+0,T=-1,S=-1->ACCEL; [17]: L=+0,T=-1,S=+0->ACCEL; [18]: L=+0,T=-1,S=+1->COAST; [19]: L=+0,T=-1,S=+2->ACCEL */
-    0, 0, 0, 0, /* [20]: L=+0,T=+0,S=-1->ACCEL; [21]: L=+0,T=+0,S=+0->ACCEL; [22]: L=+0,T=+0,S=+1->ACCEL; [23]: L=+0,T=+0,S=+2->ACCEL */
-    1, 1, 2, 1, /* [24]: L=+0,T=+1,S=-1->COAST; [25]: L=+0,T=+1,S=+0->COAST; [26]: L=+0,T=+1,S=+1->EMERGENCY_BRAKE; [27]: L=+0,T=+1,S=+2->COAST */
-    0, 0, 1, 0, /* [28]: L=+0,T=+2,S=-1->ACCEL; [29]: L=+0,T=+2,S=+0->ACCEL; [30]: L=+0,T=+2,S=+1->COAST; [31]: L=+0,T=+2,S=+2->ACCEL */
-    2, 2, 2, 2, /* [32]: L=+1,T=-1,S=-1->EMERGENCY_BRAKE; [33]: L=+1,T=-1,S=+0->EMERGENCY_BRAKE; [34]: L=+1,T=-1,S=+1->EMERGENCY_BRAKE; [35]: L=+1,T=-1,S=+2->EMERGENCY_BRAKE */
-    2, 2, 2, 2, /* [36]: L=+1,T=+0,S=-1->EMERGENCY_BRAKE; [37]: L=+1,T=+0,S=+0->EMERGENCY_BRAKE; [38]: L=+1,T=+0,S=+1->EMERGENCY_BRAKE; [39]: L=+1,T=+0,S=+2->EMERGENCY_BRAKE */
-    2, 2, 2, 2, /* [40]: L=+1,T=+1,S=-1->EMERGENCY_BRAKE; [41]: L=+1,T=+1,S=+0->EMERGENCY_BRAKE; [42]: L=+1,T=+1,S=+1->EMERGENCY_BRAKE; [43]: L=+1,T=+1,S=+2->EMERGENCY_BRAKE */
-    2, 2, 2, 2, /* [44]: L=+1,T=+2,S=-1->EMERGENCY_BRAKE; [45]: L=+1,T=+2,S=+0->EMERGENCY_BRAKE; [46]: L=+1,T=+2,S=+1->EMERGENCY_BRAKE; [47]: L=+1,T=+2,S=+2->EMERGENCY_BRAKE */
-    1, 1, 2, 1, /* [48]: L=+2,T=-1,S=-1->COAST; [49]: L=+2,T=-1,S=+0->COAST; [50]: L=+2,T=-1,S=+1->EMERGENCY_BRAKE; [51]: L=+2,T=-1,S=+2->COAST */
-    0, 0, 1, 0, /* [52]: L=+2,T=+0,S=-1->ACCEL; [53]: L=+2,T=+0,S=+0->ACCEL; [54]: L=+2,T=+0,S=+1->COAST; [55]: L=+2,T=+0,S=+2->ACCEL */
-    2, 2, 2, 2, /* [56]: L=+2,T=+1,S=-1->EMERGENCY_BRAKE; [57]: L=+2,T=+1,S=+0->EMERGENCY_BRAKE; [58]: L=+2,T=+1,S=+1->EMERGENCY_BRAKE; [59]: L=+2,T=+1,S=+2->EMERGENCY_BRAKE */
-    1, 1, 2, 1, /* [60]: L=+2,T=+2,S=-1->COAST; [61]: L=+2,T=+2,S=+0->COAST; [62]: L=+2,T=+2,S=+1->EMERGENCY_BRAKE; [63]: L=+2,T=+2,S=+2->COAST */
-};
+/* Fault bitmask reported alongside the selected action. */
+#define HIRAM_LUT_FAULT_NONE             0x00u
+#define HIRAM_LUT_FAULT_INPUT_OOB        0x01u /* an input fell outside [-1,2]; action forced to EMERGENCY_BRAKE */
+#define HIRAM_LUT_FAULT_INTEGRITY        0x02u /* CRC32 mismatch against HIRAM_POLICY_LUT_CANONICAL_CRC32 */
+
+/* Fixed-width result ABI: stable 4-byte layout for cross-TU/cross-language callers. */
+typedef struct {
+    uint8_t  action;      /* HIRAM_LUT_ACTION_*            */
+    uint8_t  fault_flags; /* bitmask of HIRAM_LUT_FAULT_*  */
+    uint16_t reserved;    /* padding; always zero          */
+} hiram_lut_result_t;
+
+/* CRC32 (IEEE 802.3, poly 0xEDB88320) of HIRAM_POLICY_LUT, computed here at
+ * generation time over the exact 64 bytes written to hiram_policy_lut.c.
+ * A regenerate always keeps this in sync with the table -- it is never
+ * hand-typed. hiram_policy_lut_verify_integrity() recomputes it on the
+ * target at startup. */
+#define HIRAM_POLICY_LUT_CANONICAL_CRC32 0x255BACBCUL
+
+/* Section placement for the STM32H723 (ARM Cortex-M7) memory map.
+ * HIRAM_ITCM_TEXT places the evaluator in zero-wait-state Instruction
+ * TCM (.itcm_text, copied from Flash by Reset_Handler -- see
+ * stm32h723zg.ld). HIRAM_DTCM_DATA places the table in zero-wait-state
+ * Data TCM (.dtcm_lut), likewise copied from Flash. Both expand to
+ * nothing without -DHIRAM_TARGET_STM32H723, so the host build (Python
+ * ctypes bridge, benchmark_lut_vs_dynamic, host tests) is unaffected. */
+#if defined(HIRAM_TARGET_STM32H723)
+#define HIRAM_ITCM_TEXT __attribute__((section(".itcm_text"), noinline, used))
+#define HIRAM_DTCM_DATA __attribute__((section(".dtcm_lut"), aligned(4)))
+#else
+#define HIRAM_ITCM_TEXT
+#define HIRAM_DTCM_DATA
+#endif
+
+extern const uint8_t HIRAM_POLICY_LUT[64] HIRAM_DTCM_DATA;
 
 /**
  * Evaluates the 64-state policy LUT.
- * Returns action index: 0=ACCEL, 1=COAST, 2=EMERGENCY_BRAKE.
- * Out-of-bounds inputs return HIRAM_LUT_ACTION_EMERGENCY_BRAKE (fail-safe).
+ * Out-of-bounds inputs set HIRAM_LUT_FAULT_INPUT_OOB and force
+ * HIRAM_LUT_ACTION_EMERGENCY_BRAKE (fail-safe) rather than indexing the
+ * table with an unchecked value.
  */
-static inline uint8_t hiram_policy_lut_step(int32_t lidar, int32_t tof, int32_t slip) {
-    if ((lidar < -1 || lidar > 2) || (tof < -1 || tof > 2) || (slip < -1 || slip > 2)) {
-        return HIRAM_LUT_ACTION_EMERGENCY_BRAKE; /* Defensive boundary fallback */
-    }
-    uint32_t idx = (uint32_t)(((lidar + 1) << 4) | ((tof + 1) << 2) | (slip + 1));
-    return HIRAM_POLICY_LUT[idx & 0x3FU];
-}
+HIRAM_ITCM_TEXT hiram_lut_result_t hiram_policy_lut_step(int32_t lidar, int32_t tof, int32_t slip);
+
+/**
+ * Recomputes CRC32 over HIRAM_POLICY_LUT and compares it against
+ * HIRAM_POLICY_LUT_CANONICAL_CRC32. Call once at startup, before the
+ * first hiram_policy_lut_step(): a false return means the table was
+ * corrupted or mis-copied from Flash and the caller must fail safe
+ * (e.g. force EMERGENCY_BRAKE and halt) rather than trust the LUT.
+ */
+bool hiram_policy_lut_verify_integrity(void);
 
 #endif /* HIRAM_POLICY_LUT_H */

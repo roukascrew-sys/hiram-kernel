@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "hiram_circuit_data.h"   /* defines circuit dimensions, then includes hiram_eval.h */
+#include "hiram_policy_lut.h"
 
 /* -----------------------------------------------------------------------------
  * STM32H723ZG Hardware Register Addresses
@@ -46,6 +47,30 @@
 #define DWT_CTRL            (*(volatile uint32_t *)0xE0001000UL)
 #define DWT_CYCCNT          (*(volatile uint32_t *)0xE0001004UL)
 #define DWT_LAR             (*(volatile uint32_t *)0xE0001FB0UL) /* Software Lock Access */
+
+/* Cortex-M7 (ARMv7-M) Memory Protection Unit -- see ARMv7-M Architecture
+   Reference Manual B3.5. 8 regions on this part (MPU_TYPE.DREGION = 8). */
+#define MPU_TYPE            (*(volatile uint32_t *)0xE000ED90UL)
+#define MPU_CTRL            (*(volatile uint32_t *)0xE000ED94UL)
+#define MPU_RNR             (*(volatile uint32_t *)0xE000ED98UL)
+#define MPU_RBAR            (*(volatile uint32_t *)0xE000ED9CUL)
+#define MPU_RASR            (*(volatile uint32_t *)0xE000EDA0UL)
+
+#define MPU_CTRL_ENABLE     (1u << 0)
+#define MPU_CTRL_PRIVDEFENA (1u << 2)  /* unconfigured addresses keep the default privileged map */
+
+/* RASR.AP: both privileged and unprivileged access Read-Only, no writes
+   permitted post-lock (Table B3-1, ARMv7-M ARM). */
+#define MPU_RASR_AP_RO_RO   (0x6u << 24)
+#define MPU_RASR_XN         (1u << 28) /* Execute-Never: set on data, cleared on code */
+/* TEX=000,C=1,B=0,S=0: Normal memory, write-through, non-shareable -- the
+   same memory type class RM0468 assigns Flash/TCM under the default MPU
+   background map, so locking these two regions changes permissions without
+   also changing how they are cached relative to the unlocked state. */
+#define MPU_RASR_NORMAL_WT  (1u << 20)
+#define MPU_RASR_ENABLE     (1u << 0)
+/* RASR.SIZE: region size = 2^(SIZE+1) bytes. */
+#define MPU_RASR_SIZE(pow2_minus1) (((uint32_t)(pow2_minus1)) << 1)
 
 /* -----------------------------------------------------------------------------
  * Clock configuration
@@ -167,6 +192,56 @@ static void hw_init(void) {
     DWT_CTRL |= (1u << 0);                /* Enable CYCCNT */
 }
 
+/* -----------------------------------------------------------------------------
+ * MPU lockdown (Task 3.3)
+ *
+ * Called once, after the ITCM/DTCM boot copy has finished and the LUT's
+ * integrity check has passed -- locking a region before it is fully written
+ * would fault on the copy itself. Two regions, both Read-Only for every
+ * privilege level from this point on:
+ *
+ *   Region 0: the whole 64 KB ITCM (.itcm_text lives inside it). Execution
+ *             stays allowed (XN=0); only writes are blocked, so a wild
+ *             pointer cannot patch the evaluator that flight-critical code
+ *             depends on for the rest of the run.
+ *   Region 1: the 256 B .dtcm_lut region (HIRAM_POLICY_LUT, padded/aligned
+ *             for exactly this by stm32h723zg.ld). Execute-Never (XN=1); a
+ *             CRC-verified constant table has no reason to ever be written
+ *             again on this target.
+ *
+ * Everything else in DTCM (the stack, .bss, .data, the .dtcm_data
+ * HiramContext scratch region) is left to the MPU's default background map
+ * via PRIVDEFENA -- unrestricted, exactly as before this function ran.
+ *
+ * NOT VALIDATED ON SILICON, matching every other register write in this
+ * file: check RASR's field layout against ARMv7-M ARM B3.5.5 before trusting
+ * this on real hardware.
+ * ----------------------------------------------------------------------------- */
+extern uint32_t _itcm_start, _itcm_end;
+extern uint32_t _dtcm_lut_start, _dtcm_lut_end;
+
+static void mpu_lock_regions_post_init(void) {
+    /* Region 0: ITCM, 64 KB, Read-Only + Executable. 64 KB = 2^16, so
+       SIZE = 16 - 1 = 15. Base 0x00000000 is trivially aligned to 64 KB. */
+    MPU_RNR  = 0u;
+    MPU_RBAR = (uint32_t)&_itcm_start;
+    MPU_RASR = MPU_RASR_AP_RO_RO | MPU_RASR_NORMAL_WT
+             | MPU_RASR_SIZE(15u) | MPU_RASR_ENABLE;
+
+    /* Region 1: .dtcm_lut, 256 B, Read-Only + Execute-Never. 256 B = 2^8,
+       so SIZE = 8 - 1 = 7. stm32h723zg.ld 256-aligns _dtcm_lut_start so a
+       single region can cover it exactly. */
+    MPU_RNR  = 1u;
+    MPU_RBAR = (uint32_t)&_dtcm_lut_start;
+    MPU_RASR = MPU_RASR_AP_RO_RO | MPU_RASR_XN | MPU_RASR_NORMAL_WT
+             | MPU_RASR_SIZE(7u) | MPU_RASR_ENABLE;
+
+    __asm__ volatile ("dsb" ::: "memory");
+    MPU_CTRL = MPU_CTRL_ENABLE | MPU_CTRL_PRIVDEFENA;
+    __asm__ volatile ("dsb" ::: "memory");
+    __asm__ volatile ("isb" ::: "memory");
+}
+
 static void uart_putc(char c) {
     while (!(USART3_ISR & (1u << 7))) {}  /* Wait for TXE (Transmit Empty) */
     USART3_TDR = (uint8_t)c;
@@ -242,10 +317,33 @@ static void delay_ms(volatile uint32_t count) {
 __attribute__((section(".dtcm_data"), aligned(8)))
 static HiramContext g_hiram_ctx;
 
+/* Fail-safe halt for a policy LUT that did not pass its startup integrity
+   check: report over UART (best-effort -- hw_init() has already run) and
+   stop rather than run target_main() on a table that might not be the one
+   that was validated. Fast LED toggle distinguishes this from the 1 Hz
+   toggle in the normal run loop for a no-debugger-attached bench check. */
+static void halt_on_lut_integrity_failure(void) {
+    uart_puts("\n!! HIRAM POLICY LUT INTEGRITY CHECK FAILED !!\n");
+    uart_puts("!! CRC32 mismatch against HIRAM_POLICY_LUT_CANONICAL_CRC32 -- halting.\n");
+    while (1) {
+        GPIOB_ODR ^= (1u << 0);
+        delay_ms(100);
+    }
+}
+
 void target_main(void) {
     clock_init();
     hw_init();
     hiram_context_init(&g_hiram_ctx);
+
+    /* The LUT table was just copied from Flash to DTCM by Reset_Handler;
+       verify it before anything below can call hiram_policy_lut_step() on
+       a torn or corrupted copy. This must run before mpu_lock_regions_post_init()
+       write-protects the table -- there would be nothing left to reverify. */
+    if (!hiram_policy_lut_verify_integrity()) {
+        halt_on_lut_integrity_failure();
+    }
+    mpu_lock_regions_post_init();
 
     uart_puts("\n\n================================================================\n");
     uart_puts("  HIRAM FLIGHT SAFETY KERNEL - STM32H723ZG (CORTEX-M7)\n");
@@ -332,6 +430,8 @@ void target_main(void) {
  * Minimal Vector Table & Startup Routine
  * ----------------------------------------------------------------------------- */
 extern uint32_t _sidata, _sdata, _edata, _sbss, _ebss, _estack;
+extern uint32_t _itcm_load, _itcm_start, _itcm_end;
+extern uint32_t _dtcm_lut_load, _dtcm_lut_start, _dtcm_lut_end;
 
 void Reset_Handler(void) {
     /* Copy initialized .data from Flash to DTCM RAM */
@@ -345,6 +445,29 @@ void Reset_Handler(void) {
     pDst = &_sbss;
     while (pDst < &_ebss) {
         *pDst++ = 0;
+    }
+
+    /* Task 3.3: copy hiram_policy_lut_step() from Flash into Instruction TCM
+       before it is ever called -- target_main() calls
+       hiram_policy_lut_verify_integrity() before the LUT table is trusted,
+       but nothing verifies the *code* copy here beyond the link-time ASSERT
+       that .itcm_text fits ITCM; a torn copy would simply crash on first
+       call, which is a detectable, fail-stop outcome on this target. */
+    pSrc = &_itcm_load;
+    pDst = &_itcm_start;
+    while (pDst < &_itcm_end) {
+        *pDst++ = *pSrc++;
+    }
+
+    /* Task 3.3: copy HIRAM_POLICY_LUT from Flash into Data TCM. Unlike
+       .dtcm_data (self-initialising scratch, NOLOAD), this section has real
+       content that must reach RAM before hiram_policy_lut_verify_integrity()
+       runs in target_main() -- that CRC32 is what actually catches a torn or
+       corrupted copy of *this* region. */
+    pSrc = &_dtcm_lut_load;
+    pDst = &_dtcm_lut_start;
+    while (pDst < &_dtcm_lut_end) {
+        *pDst++ = *pSrc++;
     }
 
     /* Jump to hardware harness */

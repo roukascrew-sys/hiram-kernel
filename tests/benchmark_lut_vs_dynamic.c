@@ -33,7 +33,7 @@ int main(void) {
                 hiram_decision_t dec;
                 hiram_status_t status = hiram_kernel_step(&ev, &ws, &dec);
                 
-                uint8_t lut_action = hiram_policy_lut_step(l, t, s);
+                uint8_t lut_action = hiram_policy_lut_step(l, t, s).action;
 
                 if (status != HIRAM_OK || dec.selected_action != lut_action) {
                     printf("[PARITY ERROR] L:%d T:%d S:%d -> Dynamic:%d, LUT:%d\n",
@@ -84,7 +84,7 @@ int main(void) {
     volatile uint32_t lut_sink = 0;
     double t0_lut = get_time_sec();
     for (int i = 0; i < BENCHMARK_ITERATIONS; ++i) {
-        lut_sink += (uint32_t)hiram_policy_lut_step(test_l[i], test_t[i], test_s[i]);
+        lut_sink += (uint32_t)hiram_policy_lut_step(test_l[i], test_t[i], test_s[i]).action;
     }
     double t1_lut = get_time_sec();
     double lut_total_us = (t1_lut - t0_lut) * 1e6;

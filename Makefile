@@ -1,84 +1,91 @@
-# HIRAM Safety Kernel - Task 3.1: Flat-Memory C Kernel build.
-#
-# Builds src/hiram_kernel.c (+ its generated include/hiram_tables.h) into a
-# static library and a standalone unit test binary, both under strict C99.
-# This Makefile is intentionally independent of the repo's CMakeLists.txt
-# (which builds the unrelated exact-rational-arithmetic hazard evaluator in
-# src/hiram_eval.c) -- distinct sources, distinct build system, no overlap.
-
+# HIRAM ASIL-D Build & Verification Orchestrator
 CC := gcc
-CFLAGS := -std=c99 -Wall -Wextra -Werror -Wvla -pedantic -O2 -Iinclude
+CFLAGS := -std=c99 -Wall -Wextra -Werror -Wvla -pedantic -O2 -Iinclude -Isrc
 AR := ar
 
 BUILD_DIR := build
+ARM_BUILD_DIR := build/arm
+
 KERNEL_SRC := src/hiram_kernel.c
 KERNEL_OBJ := $(BUILD_DIR)/hiram_kernel.o
 KERNEL_OBJ_PIC := $(BUILD_DIR)/hiram_kernel.pic.o
 KERNEL_LIB := $(BUILD_DIR)/libhiram_kernel.a
-
-ifeq ($(OS),Windows_NT)
 KERNEL_SHARED := $(BUILD_DIR)/libhiram_kernel.dll
-else
-KERNEL_SHARED := $(BUILD_DIR)/libhiram_kernel.so
-endif
 
-TEST_SRC := tests/test_c_kernel.c
-TEST_OBJ := $(BUILD_DIR)/test_c_kernel.o
-TEST_BIN := $(BUILD_DIR)/test_c_kernel
+TEST_BIN := $(BUILD_DIR)/test_c_kernel.exe
+SIL_BIN  := $(BUILD_DIR)/test_sil_fault_injection.exe
 
-.PHONY: all clean test verify_zero_alloc
+ARM_CC      := arm-none-eabi-gcc
+ARM_OBJCOPY := arm-none-eabi-objcopy
+ARM_SIZE    := arm-none-eabi-size
+ARM_CFLAGS  := -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard -std=c99 -Wall -Wextra -Werror -Wvla -pedantic -O2 -ffreestanding -fstack-usage -DHIRAM_TARGET_STM32H723 -Iinclude
+ARM_LDSCRIPT := stm32h723zg.ld
 
-# verify_zero_alloc is part of `all` itself (not just a separately-run
-# target) -- a build that produces heap-allocating object code is not
-# considered to have succeeded.
-all: $(KERNEL_LIB) $(KERNEL_SHARED) $(TEST_BIN) verify_zero_alloc
+ARM_BENCH_ELF := $(ARM_BUILD_DIR)/hiram_bench.elf
+ARM_BENCH_BIN := $(ARM_BUILD_DIR)/hiram_bench.bin
+ARM_BENCH_HEX := $(ARM_BUILD_DIR)/hiram_bench.hex
+ARM_BENCH_OBJS := $(ARM_BUILD_DIR)/dwt_bench_policy_lut.o $(ARM_BUILD_DIR)/hiram_policy_lut.o
 
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
+.PHONY: all clean verify verify_zero_alloc test sil_test bench dirs
 
-$(KERNEL_OBJ): $(KERNEL_SRC) include/hiram_kernel.h include/hiram_tables.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $(KERNEL_SRC) -o $(KERNEL_OBJ)
+all: $(KERNEL_SHARED) verify
+
+dirs:
+	@mkdir -p $(BUILD_DIR)
+	@mkdir -p $(ARM_BUILD_DIR)
+
+$(KERNEL_OBJ): $(KERNEL_SRC) include/hiram_kernel.h include/hiram_tables.h | dirs
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL_LIB): $(KERNEL_OBJ)
-	$(AR) rcs $(KERNEL_LIB) $(KERNEL_OBJ)
+	$(AR) rcs $@ $<
 
-# Separate -fPIC object for the shared library target (Task 3.2's Python
-# ctypes binding) so the static-library object above stays a plain,
-# position-dependent build -- the two are never mixed into the same archive.
-$(KERNEL_OBJ_PIC): $(KERNEL_SRC) include/hiram_kernel.h include/hiram_tables.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -fPIC -c $(KERNEL_SRC) -o $(KERNEL_OBJ_PIC)
+$(KERNEL_OBJ_PIC): $(KERNEL_SRC) include/hiram_kernel.h include/hiram_tables.h | dirs
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 $(KERNEL_SHARED): $(KERNEL_OBJ_PIC)
-	$(CC) $(CFLAGS) -fPIC -shared $(KERNEL_OBJ_PIC) -o $(KERNEL_SHARED) -lm
+	$(CC) $(CFLAGS) -shared $< -o $@ -lm
 
-$(TEST_OBJ): $(TEST_SRC) include/hiram_kernel.h include/hiram_tables.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $(TEST_SRC) -o $(TEST_OBJ)
+$(TEST_BIN): tests/test_c_kernel.c $(KERNEL_LIB) | dirs
+	$(CC) $(CFLAGS) $< $(KERNEL_LIB) -o $@ -lm
 
-$(TEST_BIN): $(TEST_OBJ) $(KERNEL_LIB)
-	$(CC) $(CFLAGS) $(TEST_OBJ) $(KERNEL_LIB) -o $(TEST_BIN) -lm
+$(SIL_BIN): tests/test_sil_fault_injection.c src/hiram_policy_lut.c $(KERNEL_LIB) | dirs
+	$(CC) $(CFLAGS) tests/test_sil_fault_injection.c src/hiram_policy_lut.c $(KERNEL_LIB) -o $@ -lm
 
 test: $(TEST_BIN)
-	./$(TEST_BIN)
+	$(TEST_BIN)
 
-# Fails the build if any dynamic heap allocation symbol (malloc/free/calloc/
-# realloc/alloca) is referenced by the compiled static library -- independent
-# of the `#pragma GCC poison` source-level guard in src/hiram_kernel.c, so a
-# symbol pulled in some other way (e.g. via linking) is still caught.
-#
-# The previous version of this target depended on and scanned the undefined
-# make variable $(LIB) (rather than $(KERNEL_LIB)) -- nm ran with no file
-# argument, silently defaulted to scanning a.out (or errored in a way that
-# wasn't what it looked like), and no reference to the just-built kernel
-# library was ever actually checked. Fixed to scan $(KERNEL_LIB) explicitly,
-# and to hard-fail (rather than mask) an nm execution failure.
+sil_test: $(SIL_BIN)
+	$(SIL_BIN)
+
 verify_zero_alloc: $(KERNEL_LIB)
-	@echo "Checking for prohibited dynamic memory symbols..."
-	@nm $(KERNEL_LIB) > $(BUILD_DIR)/symbols.txt || (echo "CRITICAL: nm failed to execute" && exit 1)
-	@if grep -E "malloc|calloc|realloc|free|alloca" $(BUILD_DIR)/symbols.txt; then \
-		echo "CRITICAL VIOLATION: Dynamic memory allocation detected!"; exit 1; \
-	else \
-		echo "PASS: Zero dynamic allocations detected in kernel binary."; \
-	fi
+	@echo "Auditing symbols for prohibited heap allocation..."
+	@nm $(KERNEL_LIB) > $(BUILD_DIR)/symbols.txt
+	@if grep -E "malloc|calloc|realloc|free|alloca" $(BUILD_DIR)/symbols.txt; then echo "CRITICAL VIOLATION: Heap symbols found"; exit 1; else echo "PASS: Zero dynamic allocations detected."; fi
+
+$(ARM_BUILD_DIR)/hiram_policy_lut.o: src/hiram_policy_lut.c include/hiram_policy_lut.h | dirs
+	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
+
+$(ARM_BUILD_DIR)/dwt_bench_policy_lut.o: benchmarks/dwt_bench_policy_lut.c include/hiram_policy_lut.h | dirs
+	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
+
+$(ARM_BENCH_ELF): $(ARM_BENCH_OBJS) $(ARM_LDSCRIPT)
+	$(ARM_CC) $(ARM_CFLAGS) -T $(ARM_LDSCRIPT) -nostartfiles -Wl,--gc-sections -Wl,-Map=$(ARM_BUILD_DIR)/hiram_bench.map $(ARM_BENCH_OBJS) -lgcc -o $@
+
+$(ARM_BENCH_BIN): $(ARM_BENCH_ELF)
+	$(ARM_OBJCOPY) -O binary $< $@
+
+$(ARM_BENCH_HEX): $(ARM_BENCH_ELF)
+	$(ARM_OBJCOPY) -O ihex $< $@
+
+bench: $(ARM_BENCH_BIN) $(ARM_BENCH_HEX)
+	@echo "--- ARM CORTEX-M7 SECTION SIZES ---"
+	@$(ARM_SIZE) $(ARM_BENCH_ELF)
+
+verify: $(KERNEL_SHARED) verify_zero_alloc test sil_test bench
+	@echo "===================================================================="
+	@echo "  AUDIT READY: ALL HOST & CROSS-COMPILED TARGETS FULLY VERIFIED"
+	@echo "===================================================================="
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -241,15 +241,26 @@ jobs:
           cd tmp_test_build
           arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -O3 -fstack-usage $STRICT \
             -I../include -I../include/hiram -c ../src/hiram_eval.c -o hiram_eval_m7.o
+      # Task 3.3: hiram_policy_lut.c/.h. -DHIRAM_TARGET_STM32H723 switches on
+      # the HIRAM_ITCM_TEXT/HIRAM_DTCM_DATA section-placement macros -- without
+      # it this still links (the macros just expand to nothing), but the LUT
+      # table and evaluator end up in ordinary Flash .text/.rodata instead of
+      # the ITCM/DTCM stm32h723zg.ld actually reserves for them, which is the
+      # placement this whole job exists to prove links and fits.
+      - name: Compile policy LUT (Task 3.3 ITCM/DTCM placement)
+        run: |
+          arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -O3 -Iinclude -DHIRAM_TARGET_STM32H723 \
+            -c src/hiram_policy_lut.c -o tmp_test_build/hiram_policy_lut_m7.o
       - name: Compile target startup
         run: |
-          arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -O3 -Iinclude -Iinclude/hiram \
+          arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -O3 -Iinclude -Iinclude/hiram -DHIRAM_TARGET_STM32H723 \
             -c src/target_main.c -o tmp_test_build/target_main_m7.o
       - name: Link firmware (stack-reserve ASSERT must hold)
         run: |
           arm-none-eabi-gcc -T stm32h723zg.ld -nostartfiles -mcpu=cortex-m7 -mthumb \
             -Wl,--gc-sections -Wl,-Map=tmp_test_build/hiram_firmware.map \
-            tmp_test_build/hiram_eval_m7.o tmp_test_build/target_main_m7.o -lgcc \
+            tmp_test_build/hiram_eval_m7.o tmp_test_build/hiram_policy_lut_m7.o \
+            tmp_test_build/target_main_m7.o -lgcc \
             -o tmp_test_build/hiram_firmware.elf
       - name: Report size and stack usage
         run: |
