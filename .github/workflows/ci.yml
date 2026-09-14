@@ -251,17 +251,38 @@ jobs:
         run: |
           arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -O3 -Iinclude -DHIRAM_TARGET_STM32H723 \
             -c src/hiram_policy_lut.c -o tmp_test_build/hiram_policy_lut_m7.o
+      # B4: src/target_main.c is the single owner of the startup path (vector
+      # table, Reset_Handler, clocking, console, MPU lockdown, actuator safe
+      # state); benchmarks/dwt_bench_policy_lut.c contributes the DWT routine
+      # target_main() calls. Both must be in the image, and the Makefile's
+      # verify_release_image target asserts the resulting symbols are present.
       - name: Compile target startup
         run: |
           arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -O3 -Iinclude -Iinclude/hiram -DHIRAM_TARGET_STM32H723 \
             -c src/target_main.c -o tmp_test_build/target_main_m7.o
+      - name: Compile DWT benchmark routine
+        run: |
+          arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -O3 -Iinclude -Iinclude/hiram -DHIRAM_TARGET_STM32H723 \
+            -c benchmarks/dwt_bench_policy_lut.c -o tmp_test_build/dwt_bench_m7.o
       - name: Link firmware (stack-reserve ASSERT must hold)
         run: |
           arm-none-eabi-gcc -T stm32h723zg.ld -nostartfiles -mcpu=cortex-m7 -mthumb \
             -Wl,--gc-sections -Wl,-Map=tmp_test_build/hiram_firmware.map \
             tmp_test_build/hiram_eval_m7.o tmp_test_build/hiram_policy_lut_m7.o \
-            tmp_test_build/target_main_m7.o -lgcc \
+            tmp_test_build/target_main_m7.o tmp_test_build/dwt_bench_m7.o -lgcc \
             -o tmp_test_build/hiram_firmware.elf
+      - name: Release image must contain the safety architecture
+        run: |
+          set -euo pipefail
+          for sym in target_main hiram_mpu_lock_regions hiram_actuator_inhibit \
+                     hiram_safe_state_trap hiram_policy_lut_init HardFault_Handler; do
+            if arm-none-eabi-nm tmp_test_build/hiram_firmware.elf | grep -qE " [TtWw] ${sym}$"; then
+              echo "  [OK]   ${sym}"
+            else
+              echo "::error::${sym} is missing from the linked firmware image"
+              exit 1
+            fi
+          done
       - name: Report size and stack usage
         run: |
           arm-none-eabi-size tmp_test_build/hiram_firmware.elf

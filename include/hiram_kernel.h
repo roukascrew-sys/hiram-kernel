@@ -62,6 +62,8 @@ typedef enum {
     HIRAM_ERR_CUSTODY_MISMATCH = 1, /* embedded HIRAM_FROZEN_IR_DIGEST != the certified baseline */
     HIRAM_ERR_INVALID_EVIDENCE = 2, /* an evidence field outside {-1, 0, .., HIRAM_N_SENSOR_STATES-1} */
     HIRAM_ERR_NULL_POINTER = 3,
+    HIRAM_ERR_MODEL_CORRUPTED = 4,  /* a HIRAM_LOSS_MATRIX entry is non-finite or negative */
+    HIRAM_ERR_NUMERICAL_FAULT = 5,  /* a non-finite or negative value reached the inference arithmetic */
 } hiram_status_t;
 
 /* Alias onto the generated table macro so this header's struct definition
@@ -119,6 +121,51 @@ typedef struct {
 hiram_status_t hiram_kernel_verify_custody(void);
 
 /*
+ * Checks every entry of a loss matrix laid out like HIRAM_LOSS_MATRIX
+ * (HIRAM_N_ACTIONS * HIRAM_LOSS_ACTION_STRIDE doubles) against the two
+ * properties the decision rule depends on:
+ *
+ *   finite   -- a NaN entry makes every `<` comparison in the argmin false,
+ *               so the scan silently keeps whatever index it started at.
+ *   >= 0.0   -- loss is a cost. A negative entry makes the expected loss of
+ *               an action fall as its probability of causing harm rises, so
+ *               the loss-minimising action becomes the *most* dangerous one.
+ *
+ * The pre-audit review flipped the sign of HIRAM_LOSS_MATRIX[3] (+500 ->
+ * -500, the cost of ACCEL into a real obstacle) and the kernel returned
+ * ACCEL with HIRAM_OK. A minimisation over a matrix that is not a cost
+ * matrix is not a safety decision, so this is checked before the matrix is
+ * used rather than after the answer looks wrong.
+ *
+ * Returns HIRAM_OK, HIRAM_ERR_NULL_POINTER if `matrix` is NULL, or
+ * HIRAM_ERR_MODEL_CORRUPTED. Exported so tests/test_sil_fault_injection.c
+ * can drive the production predicate over injected mutations rather than
+ * restating it.
+ */
+hiram_status_t hiram_kernel_validate_loss_matrix(const double *matrix);
+
+/*
+ * The decision half of hiram_kernel_step(), over a caller-supplied joint
+ * distribution `joint` (HIRAM_N_POSTERIOR unnormalised, non-negative masses
+ * over (TrueObstacle, DecelCapability)): validates the loss matrix and the
+ * joint, normalises (or falls back to HIRAM_PRIOR_MARGINAL when the total
+ * mass is below the zero-likelihood guard), evaluates expected loss per
+ * action and selects the loss-minimising one with EMERGENCY_BRAKE > COAST >
+ * ACCEL tie-breaking.
+ *
+ * hiram_kernel_step() is exactly "marginalise, then call this", so the
+ * numerical guards below are the same code on both paths. Exported because
+ * the joint is the only place an injected NaN/Inf/negative mass can enter the
+ * arithmetic, and the SIL suite has to be able to put one there.
+ *
+ * `*out` is fully populated on every path, including every error path.
+ * Returns HIRAM_ERR_NULL_POINTER, HIRAM_ERR_MODEL_CORRUPTED,
+ * HIRAM_ERR_NUMERICAL_FAULT, or HIRAM_OK; any non-OK status leaves
+ * selected_action == EMERGENCY_BRAKE and fallback_active == true.
+ */
+hiram_status_t hiram_kernel_decide(const double *joint, hiram_decision_t *out);
+
+/*
  * Runs one inference + decision cycle: computes the posterior over
  * (TrueObstacle, DecelCapability) given `evidence` (marginalizing
  * TrackCondition and any unobserved/DROPOUT sensor), falls back to the
@@ -129,8 +176,18 @@ hiram_status_t hiram_kernel_verify_custody(void);
  * Writes the result into `*out`; `*ws` is scratch space, contents undefined
  * on return.
  *
- * Returns HIRAM_ERR_NULL_POINTER if any pointer is NULL (evidence/ws/out
- * are all left untouched in that case -- there is no `*out` to write into).
+ * Returns HIRAM_ERR_NULL_POINTER if any pointer is NULL. When `out` itself
+ * is non-NULL it is still fully overwritten with the safe EMERGENCY_BRAKE
+ * fallback before returning -- a caller that reuses one hiram_decision_t
+ * across calls and passes a NULL workspace by mistake must not be left
+ * reading the previous call's ACCEL out of a struct the failed call never
+ * touched. Only `out == NULL` leaves nothing written, because there is then
+ * no object to write to.
+ *
+ * Returns HIRAM_ERR_MODEL_CORRUPTED if HIRAM_LOSS_MATRIX fails
+ * hiram_kernel_validate_loss_matrix(), and HIRAM_ERR_NUMERICAL_FAULT if a
+ * non-finite or negative value reaches the inference arithmetic. Both force
+ * EMERGENCY_BRAKE with fallback_active == true.
  *
  * Returns HIRAM_ERR_INVALID_EVIDENCE if an evidence field is outside
  * {HIRAM_UNOBSERVED} u [0, HIRAM_N_SENSOR_STATES); *out is still fully

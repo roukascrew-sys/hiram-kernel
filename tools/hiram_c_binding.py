@@ -39,9 +39,13 @@ HIRAM_STATUS_NAMES = {
     1: "HIRAM_ERR_CUSTODY_MISMATCH",
     2: "HIRAM_ERR_INVALID_EVIDENCE",
     3: "HIRAM_ERR_NULL_POINTER",
+    4: "HIRAM_ERR_MODEL_CORRUPTED",
+    5: "HIRAM_ERR_NUMERICAL_FAULT",
 }
 
 HIRAM_ERR_INVALID_EVIDENCE = 2
+HIRAM_ERR_MODEL_CORRUPTED = 4
+HIRAM_ERR_NUMERICAL_FAULT = 5
 
 # The only values hiram_evidence_t's int32 fields are ever valid for --
 # mirrors hiram_evidence_value_in_range() in src/hiram_kernel.c exactly.
@@ -90,11 +94,17 @@ class HiramEvidence(ctypes.Structure):
 class HiramDecision(ctypes.Structure):
     """Mirrors hiram_decision_t (include/hiram_kernel.h)."""
 
+    # M3: selected_action_index is int32_t in include/hiram_kernel.h, not
+    # uint32_t. The widths matched, so the struct layout was right and the
+    # mismatch was invisible for every value the kernel actually emits (0..2)
+    # -- but it would have read a negative sentinel back as ~4.29e9 rather
+    # than as a negative number, turning "no action selected" into a
+    # plausible-looking action index. Signedness is part of the ABI.
     _fields_ = [
         ("posterior", ctypes.c_double * 6),
         ("expected_losses", ctypes.c_double * 3),
         ("selected_action", ctypes.c_int32),
-        ("selected_action_index", ctypes.c_uint32),
+        ("selected_action_index", ctypes.c_int32),
         ("fallback_active", ctypes.c_bool),
         ("status", ctypes.c_int32),
     ]

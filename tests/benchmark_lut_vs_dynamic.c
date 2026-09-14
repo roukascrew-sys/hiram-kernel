@@ -25,6 +25,14 @@ int main(void) {
     printf("     HIRAM BENCHMARK: DYNAMIC BAYESIAN ENGINE VS POLICY LUT         \n");
     printf("====================================================================\n");
 
+    /* The LUT reports EMERGENCY_BRAKE on every call until it is in service, so
+       without this the parity sweep below would compare the dynamic kernel
+       against the fail-safe path and the timing loop would measure the guard. */
+    if (!hiram_policy_lut_init()) {
+        printf("FAILED: hiram_policy_lut_init() rejected the sealed table.\n");
+        return 1;
+    }
+
     /* 1. Bit-Exact Policy Parity across all 64 combinations */
     for (int l = -1; l <= 2; ++l) {
         for (int t = -1; t <= 2; ++t) {

@@ -61,6 +61,23 @@ static void hiram_evaluate_expected_losses(const double *posterior, double *expe
     }
 }
 
+hiram_status_t hiram_kernel_validate_loss_matrix(const double *matrix) {
+    int32_t i;
+
+    if (matrix == NULL) {
+        return HIRAM_ERR_NULL_POINTER;
+    }
+    for (i = 0; i < (HIRAM_N_ACTIONS * HIRAM_LOSS_ACTION_STRIDE); i++) {
+        /* isfinite() rejects NaN and both infinities; the second test then
+         * only ever sees an ordered value, so the sign comparison means what
+         * it looks like it means. */
+        if (!isfinite(matrix[i]) || (matrix[i] < 0.0)) {
+            return HIRAM_ERR_MODEL_CORRUPTED;
+        }
+    }
+    return HIRAM_OK;
+}
+
 /*
  * Populates `*out` with the conservative safe-fallback decision: the
  * model's true prior, EMERGENCY_BRAKE, and fallback_active=true. Used both
@@ -75,7 +92,18 @@ static void hiram_populate_safe_fallback(hiram_decision_t *out, hiram_status_t s
     for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
         out->posterior[i] = HIRAM_PRIOR_MARGINAL[i];
     }
-    hiram_evaluate_expected_losses(out->posterior, out->expected_losses);
+    if (hiram_kernel_validate_loss_matrix(HIRAM_LOSS_MATRIX) == HIRAM_OK) {
+        hiram_evaluate_expected_losses(out->posterior, out->expected_losses);
+    } else {
+        /* The diagnostic field cannot be filled from a matrix that has just
+         * been rejected -- doing so would publish numbers derived from known-
+         * corrupt data next to a status that says the data is corrupt. Zero
+         * is the one value that carries no claim. The action below is
+         * EMERGENCY_BRAKE regardless, so nothing downstream depends on it. */
+        for (i = 0; i < HIRAM_N_ACTIONS; i++) {
+            out->expected_losses[i] = 0.0;
+        }
+    }
     out->selected_action = HIRAM_EMERGENCY_BRAKE_INDEX;
     out->selected_action_index = HIRAM_EMERGENCY_BRAKE_INDEX;
     out->fallback_active = true;
@@ -89,12 +117,122 @@ hiram_status_t hiram_kernel_verify_custody(void) {
     return HIRAM_OK;
 }
 
+hiram_status_t hiram_kernel_decide(const double *joint, hiram_decision_t *out) {
+    int32_t i;
+    int32_t a;
+    int32_t best_idx;
+    double joint_sum = 0.0;
+
+    if (out == NULL) {
+        return HIRAM_ERR_NULL_POINTER;
+    }
+    if (joint == NULL) {
+        hiram_populate_safe_fallback(out, HIRAM_ERR_NULL_POINTER);
+        return HIRAM_ERR_NULL_POINTER;
+    }
+
+    /* B2: the model is checked before it is used. An argmin over a matrix
+     * that is not a cost matrix will still return an index, and that index
+     * is what actuates the brakes. */
+    if (hiram_kernel_validate_loss_matrix(HIRAM_LOSS_MATRIX) != HIRAM_OK) {
+        hiram_populate_safe_fallback(out, HIRAM_ERR_MODEL_CORRUPTED);
+        return HIRAM_ERR_MODEL_CORRUPTED;
+    }
+
+    /* M2: every mass must be a real, non-negative probability mass before it
+     * is summed. A NaN from a corrupted CPT used to survive the whole
+     * pipeline -- `NaN < HIRAM_ZERO_LIKELIHOOD_GUARD` is false, so the
+     * zero-likelihood fallback did not fire, and NaN/NaN then propagated
+     * through the posterior into every expected loss. The downstream
+     * finiteness check did force EMERGENCY_BRAKE, but it reported HIRAM_OK
+     * with fallback_active == false: a silent degradation, indistinguishable
+     * in the telemetry from a genuine braking decision. */
+    for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
+        if (!isfinite(joint[i]) || (joint[i] < 0.0)) {
+            hiram_populate_safe_fallback(out, HIRAM_ERR_NUMERICAL_FAULT);
+            return HIRAM_ERR_NUMERICAL_FAULT;
+        }
+        joint_sum += joint[i];
+    }
+    /* Catches an overflow to +Inf in the summation itself, which no single
+     * term being finite can rule out. */
+    if (!isfinite(joint_sum)) {
+        hiram_populate_safe_fallback(out, HIRAM_ERR_NUMERICAL_FAULT);
+        return HIRAM_ERR_NUMERICAL_FAULT;
+    }
+
+    const bool fallback_active = joint_sum < HIRAM_ZERO_LIKELIHOOD_GUARD;
+    if (fallback_active) {
+        /* Degenerate/contradictory evidence: revert to the model's true
+         * physical prior rather than dividing by (near) zero, matching
+         * _compute_posterior_with_diagnostics's fallback branch. */
+        for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
+            out->posterior[i] = HIRAM_PRIOR_MARGINAL[i];
+        }
+    } else {
+        for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
+            out->posterior[i] = joint[i] / joint_sum;
+        }
+    }
+
+    /* evaluate_expected_loss is unconditional in Python's step() (even on
+     * the fallback path, to populate expected_losses for diagnostics) --
+     * mirrored here the same way. */
+    hiram_evaluate_expected_losses(out->posterior, out->expected_losses);
+
+    /* Both inputs to the dot product are now known finite and non-negative,
+     * so only overflow in the accumulation can produce a non-finite loss.
+     * That is a numerical fault in its own right, and is reported as one
+     * rather than folded into a silent EMERGENCY_BRAKE with HIRAM_OK. */
+    for (a = 0; a < HIRAM_N_ACTIONS; a++) {
+        if (!isfinite(out->expected_losses[a])) {
+            hiram_populate_safe_fallback(out, HIRAM_ERR_NUMERICAL_FAULT);
+            return HIRAM_ERR_NUMERICAL_FAULT;
+        }
+    }
+
+    if (fallback_active) {
+        /* Python: the fallback path unconditionally overrides whatever
+         * evaluate_expected_loss would have picked. */
+        best_idx = HIRAM_EMERGENCY_BRAKE_INDEX;
+    } else {
+        best_idx = 0;
+        for (a = 1; a < HIRAM_N_ACTIONS; a++) {
+            const bool strictly_lower_loss = out->expected_losses[a] < out->expected_losses[best_idx];
+            const bool tied_but_higher_priority =
+                out->expected_losses[a] == out->expected_losses[best_idx] &&
+                HIRAM_TIE_BREAK_PRIORITY[a] < HIRAM_TIE_BREAK_PRIORITY[best_idx];
+            if (strictly_lower_loss || tied_but_higher_priority) {
+                best_idx = a;
+            }
+        }
+    }
+
+    out->selected_action = best_idx;
+    out->selected_action_index = best_idx;
+    out->fallback_active = fallback_active;
+    out->status = HIRAM_OK;
+    return HIRAM_OK;
+}
+
 hiram_status_t hiram_kernel_step(const hiram_evidence_t *evidence, hiram_workspace_t *ws, hiram_decision_t *out) {
     if (evidence == NULL || ws == NULL || out == NULL) {
-        /* No `*out` to safely write into (it may itself be the NULL
-         * pointer) -- nothing to reconcile here, unlike the invalid-
-         * evidence case below. */
+        /* M2: `out` is overwritten whenever there is an `out` to overwrite.
+         * The previous contract left it untouched, so a caller reusing one
+         * hiram_decision_t across calls kept reading the last successful
+         * decision -- an ACCEL that no longer had anything to do with the
+         * current step -- out of a struct whose status field still said OK. */
+        if (out != NULL) {
+            hiram_populate_safe_fallback(out, HIRAM_ERR_NULL_POINTER);
+        }
         return HIRAM_ERR_NULL_POINTER;
+    }
+    /* Model integrity outranks evidence validity: a corrupted loss matrix
+     * must be reported as such even on a step whose evidence would have been
+     * rejected anyway, rather than being masked by the cheaper rejection. */
+    if (hiram_kernel_validate_loss_matrix(HIRAM_LOSS_MATRIX) != HIRAM_OK) {
+        hiram_populate_safe_fallback(out, HIRAM_ERR_MODEL_CORRUPTED);
+        return HIRAM_ERR_MODEL_CORRUPTED;
     }
     if (!hiram_evidence_value_in_range(evidence->lidar_obs) ||
         !hiram_evidence_value_in_range(evidence->tof_obs) ||
@@ -144,63 +282,9 @@ hiram_status_t hiram_kernel_step(const hiram_evidence_t *evidence, hiram_workspa
         }
     }
 
-    double likelihood = 0.0;
-    for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
-        likelihood += ws->posterior_scratch[i];
-    }
-
-    const bool fallback_active = likelihood < HIRAM_ZERO_LIKELIHOOD_GUARD;
-    if (fallback_active) {
-        /* Degenerate/contradictory evidence: revert to the model's true
-         * physical prior rather than dividing by (near) zero, matching
-         * _compute_posterior_with_diagnostics's fallback branch. */
-        for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
-            out->posterior[i] = HIRAM_PRIOR_MARGINAL[i];
-        }
-    } else {
-        for (i = 0; i < HIRAM_N_POSTERIOR; i++) {
-            out->posterior[i] = ws->posterior_scratch[i] / likelihood;
-        }
-    }
-
-    /* evaluate_expected_loss is unconditional in Python's step() (even on
-     * the fallback path, to populate expected_losses for diagnostics) --
-     * mirrored here the same way. */
-    hiram_evaluate_expected_losses(out->posterior, out->expected_losses);
-
-    int32_t a;
-    int32_t best_idx;
-    if (fallback_active) {
-        /* Python: the fallback path unconditionally overrides whatever
-         * evaluate_expected_loss would have picked. */
-        best_idx = HIRAM_EMERGENCY_BRAKE_INDEX;
-    } else {
-        bool all_finite = true;
-        for (a = 0; a < HIRAM_N_ACTIONS; a++) {
-            if (!isfinite(out->expected_losses[a])) {
-                all_finite = false;
-                break;
-            }
-        }
-        if (!all_finite) {
-            best_idx = HIRAM_EMERGENCY_BRAKE_INDEX;
-        } else {
-            best_idx = 0;
-            for (a = 1; a < HIRAM_N_ACTIONS; a++) {
-                const bool strictly_lower_loss = out->expected_losses[a] < out->expected_losses[best_idx];
-                const bool tied_but_higher_priority =
-                    out->expected_losses[a] == out->expected_losses[best_idx] &&
-                    HIRAM_TIE_BREAK_PRIORITY[a] < HIRAM_TIE_BREAK_PRIORITY[best_idx];
-                if (strictly_lower_loss || tied_but_higher_priority) {
-                    best_idx = a;
-                }
-            }
-        }
-    }
-
-    out->selected_action = best_idx;
-    out->selected_action_index = best_idx;
-    out->fallback_active = fallback_active;
-    out->status = HIRAM_OK;
-    return HIRAM_OK;
+    /* The marginalisation above is the only part of a step that is specific
+     * to evidence; normalisation, loss evaluation, the numerical guards and
+     * the argmin are shared with every other caller that can produce a joint
+     * distribution, so they live in one place. */
+    return hiram_kernel_decide(ws->posterior_scratch, out);
 }
